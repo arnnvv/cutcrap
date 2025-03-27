@@ -78,6 +78,7 @@ Important: Return ONLY the formatted transcript without any introductions, expla
 - Removing redundant descriptions and unnecessary elaborations
 - Using extremely simple English with basic vocabulary (like for a 10-year-old)
 - must maintain the origional narration style as it is.
+- If you identify any headings in the text, format them as "# Heading" on their own line in markdown style.
 
 Important: Return ONLY the condensed text without any introductions, explanations, or summaries. Do not include phrases like "Here's the condensed version" or "In summary". Just provide the rewritten text directly.`, targetWordCount)
 	}

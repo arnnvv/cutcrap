@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -11,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jung-kurt/gofpdf"
+	"github.com/russross/blackfriday/v2"
 )
 
 func enableCors(w *http.ResponseWriter) {
@@ -122,13 +127,28 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 		}
 
 		// 7. RESPONSE
-		w.Header().Set("Content-Type", "text/plain")
 		combinedResult := combineResults(results)
 		outputWordCount := len(strings.Fields(combinedResult))
 		log.Printf("RESPONSE READY | Input: %d words | Output: %d words | Reduction: %.1f%%",
 			inputWordCount, outputWordCount,
 			100.0-(float64(outputWordCount)/float64(inputWordCount))*100.0)
-		io.WriteString(w, combinedResult)
+
+		// Check if the output should be PDF or text
+		if strings.Contains(combinedResult, "# ") {
+			// Contains markdown headings, return as PDF
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Header().Set("Content-Disposition", "attachment; filename=processed.pdf")
+
+			if err := markdownToPDF(combinedResult, w); err != nil {
+				log.Printf("PDF CONVERSION FAILED: %v", err)
+				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// No markdown headings, return as text
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, combinedResult)
+		}
 	}
 }
 
@@ -141,4 +161,130 @@ func combineResults(results []string) string {
 		}
 	}
 	return final.String()
+}
+
+// markdownToPDF converts markdown text to PDF and writes to the provided writer
+func markdownToPDF(markdown string, w io.Writer) error {
+	// Parse markdown to HTML
+	html := blackfriday.Run([]byte(markdown))
+
+	// Create a new PDF document
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.SetMargins(20, 20, 20) // Set margins for better readability
+	pdf.AddPage()
+
+	// Add a title
+	pdf.SetFont("Arial", "B", 18)
+	pdf.Cell(0, 10, "Processed Document")
+	pdf.Ln(15)
+
+	// Process the HTML content
+	lines := strings.Split(string(html), "\n")
+	inParagraph := false
+	paragraphText := ""
+
+	for _, line := range lines {
+		// Handle headings (# Heading)
+		if strings.Contains(line, "<h1>") {
+			// If we were in a paragraph, finish it first
+			if inParagraph {
+				pdf.SetFont("Arial", "", 12)
+				pdf.MultiCell(0, 6, paragraphText, "", "", false)
+				pdf.Ln(5)
+				inParagraph = false
+				paragraphText = ""
+			}
+
+			heading := stripTags(line)
+			pdf.SetFont("Arial", "B", 16)
+			pdf.Cell(0, 10, heading)
+			pdf.Ln(10)
+		} else if strings.Contains(line, "<h2>") {
+			// If we were in a paragraph, finish it first
+			if inParagraph {
+				pdf.SetFont("Arial", "", 12)
+				pdf.MultiCell(0, 6, paragraphText, "", "", false)
+				pdf.Ln(5)
+				inParagraph = false
+				paragraphText = ""
+			}
+
+			heading := stripTags(line)
+			pdf.SetFont("Arial", "B", 14)
+			pdf.Cell(0, 10, heading)
+			pdf.Ln(8)
+		} else if strings.Contains(line, "<h3>") {
+			// If we were in a paragraph, finish it first
+			if inParagraph {
+				pdf.SetFont("Arial", "", 12)
+				pdf.MultiCell(0, 6, paragraphText, "", "", false)
+				pdf.Ln(5)
+				inParagraph = false
+				paragraphText = ""
+			}
+
+			heading := stripTags(line)
+			pdf.SetFont("Arial", "BI", 12)
+			pdf.Cell(0, 10, heading)
+			pdf.Ln(8)
+		} else if strings.Contains(line, "<p>") {
+			// Regular paragraph text
+			text := stripTags(line)
+			if text != "" {
+				if !inParagraph {
+					inParagraph = true
+					paragraphText = text
+				} else {
+					paragraphText += " " + text
+				}
+			}
+		} else if line == "" && inParagraph {
+			// End of paragraph
+			pdf.SetFont("Arial", "", 12)
+			pdf.MultiCell(0, 6, paragraphText, "", "", false)
+			pdf.Ln(5)
+			inParagraph = false
+			paragraphText = ""
+		}
+	}
+
+	// If we're still in a paragraph at the end, finish it
+	if inParagraph {
+		pdf.SetFont("Arial", "", 12)
+		pdf.MultiCell(0, 6, paragraphText, "", "", false)
+	}
+
+	// Add page numbers
+	pageCount := pdf.PageCount()
+	for i := 1; i <= pageCount; i++ {
+		pdf.SetPage(i)
+		pdf.SetY(-15)
+		pdf.SetFont("Arial", "I", 8)
+		pdf.CellFormat(0, 10, fmt.Sprintf("Page %d of %d", i, pageCount), "", 0, "C", false, 0, "")
+	}
+
+	// Write the PDF to the output writer
+	return pdf.Output(w)
+}
+
+// stripTags removes HTML tags from a string
+func stripTags(html string) string {
+	var buf bytes.Buffer
+	var inTag bool
+
+	for _, r := range html {
+		if r == '<' {
+			inTag = true
+			continue
+		}
+		if r == '>' {
+			inTag = false
+			continue
+		}
+		if !inTag {
+			buf.WriteRune(r)
+		}
+	}
+
+	return strings.TrimSpace(buf.String())
 }

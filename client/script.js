@@ -139,27 +139,40 @@ processButton.addEventListener('click', async () => {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        // Get text content
-        const processedText = await response.text();
-
-        // Create blob from text content
-        const blob = new Blob([processedText], {type: 'text/plain'});
-
+        // Check content type to determine if it's PDF or text
+        const contentType = response.headers.get('Content-Type');
+        console.log("Response content type:", contentType);
+        
+        // Get response as array buffer (works for both text and binary data)
+        const responseData = await response.arrayBuffer();
+        
+        // Determine file type and set appropriate MIME type
+        let mimeType = 'text/plain';
+        let fileExtension = '.txt';
+        
+        if (contentType && contentType.includes('application/pdf')) {
+            mimeType = 'application/pdf';
+            fileExtension = '.pdf';
+        }
+        
+        // Create appropriate blob with correct MIME type
+        const blob = new Blob([responseData], {type: mimeType});
+        
         // Create download URL
         const url = window.URL.createObjectURL(blob);
         downloadLink.href = url;
-
+        
         // Show result card and update stats
         resultCard.style.display = 'block';
         originalSize.textContent = formatBytes(text.length);
-        processedSize.textContent = formatBytes(processedText.length);
-
-        const reduction = ((text.length - processedText.length) / text.length * 100).toFixed(1);
+        processedSize.textContent = formatBytes(responseData.byteLength);
+        
+        const reduction = ((text.length - responseData.byteLength) / text.length * 100).toFixed(1);
         reductionPercent.textContent = `${reduction}%`;
-
-        // Set appropriate filename for download based on mode
-        const filename = mode === 'transcript' ? 'processed_transcript.txt' : 'processed.txt';
-        downloadLink.setAttribute('download', filename);
+        
+        // Set appropriate filename based on content type and mode
+        const baseFilename = mode === 'transcript' ? 'processed_transcript' : 'processed';
+        downloadLink.setAttribute('download', baseFilename + fileExtension);
 
     } catch (error) {
         console.error('Error processing text:', error);
