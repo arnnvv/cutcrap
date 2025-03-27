@@ -11,15 +11,12 @@ const originalSize = document.getElementById('original-size');
 const processedSize = document.getElementById('processed-size');
 const reductionPercent = document.getElementById('reduction-percent');
 
-// Set your backend URL here
 const baseUrl = 'http://localhost:8080';
 
-// Update ratio value display
 ratioInput.addEventListener('input', () => {
     ratioValue.textContent = ratioInput.value;
 });
 
-// Display file name when selected
 fileInput.addEventListener('change', async (event) => {
     const file = event.target.files[0];
     if (file) {
@@ -27,10 +24,8 @@ fileInput.addEventListener('change', async (event) => {
 
         if (file.type === 'application/pdf') {
             try {
-                // Show loading state for PDF processing
                 fileName.textContent = `Processing ${file.name}...`;
 
-                // Initialize PDF.js
                 const pdfjsLib = window['pdfjs-dist/build/pdf'];
                 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.js`;
 
@@ -41,7 +36,6 @@ fileInput.addEventListener('change', async (event) => {
                         const pdf = await pdfjsLib.getDocument(typedarray).promise;
                         let text = '';
 
-                        // Process each page
                         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
                             fileName.textContent = `Processing page ${pageNum}/${pdf.numPages}...`;
                             const page = await pdf.getPage(pageNum);
@@ -75,7 +69,6 @@ fileInput.addEventListener('change', async (event) => {
     }
 });
 
-// Format bytes to human-readable format
 function formatBytes(bytes, decimals = 2) {
     if (bytes === 0) return '0 Bytes';
 
@@ -88,7 +81,6 @@ function formatBytes(bytes, decimals = 2) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
-// Get selected processing mode
 function getSelectedMode() {
     return document.querySelector('input[name="mode"]:checked').value;
 }
@@ -98,14 +90,12 @@ processButton.addEventListener('click', async () => {
     const ratio = ratioInput.value;
     const mode = getSelectedMode();
 
-    // Debug logging
     console.log("Selected mode:", mode);
     console.log("Radio buttons:", {
         document: document.getElementById('mode-document').checked,
         transcript: document.getElementById('mode-transcript').checked
     });
 
-    // Input validation
     if (!text) {
         alert('Please enter text to process.');
         return;
@@ -116,7 +106,6 @@ processButton.addEventListener('click', async () => {
         return;
     }
 
-    // Show loading state
     loadingIndicator.style.display = 'flex';
     processButton.disabled = true;
 
@@ -139,14 +128,11 @@ processButton.addEventListener('click', async () => {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        // Check content type to determine if it's PDF or text
         const contentType = response.headers.get('Content-Type');
         console.log("Response content type:", contentType);
         
-        // Get response as array buffer (works for both text and binary data)
         const responseData = await response.arrayBuffer();
         
-        // Determine file type and set appropriate MIME type
         let mimeType = 'text/plain';
         let fileExtension = '.txt';
         
@@ -155,14 +141,11 @@ processButton.addEventListener('click', async () => {
             fileExtension = '.pdf';
         }
         
-        // Create appropriate blob with correct MIME type
         const blob = new Blob([responseData], {type: mimeType});
         
-        // Create download URL
         const url = window.URL.createObjectURL(blob);
         downloadLink.href = url;
         
-        // Show result card and update stats
         resultCard.style.display = 'block';
         originalSize.textContent = formatBytes(text.length);
         processedSize.textContent = formatBytes(responseData.byteLength);
@@ -170,7 +153,6 @@ processButton.addEventListener('click', async () => {
         const reduction = ((text.length - responseData.byteLength) / text.length * 100).toFixed(1);
         reductionPercent.textContent = `${reduction}%`;
         
-        // Set appropriate filename based on content type and mode
         const baseFilename = mode === 'transcript' ? 'processed_transcript' : 'processed';
         downloadLink.setAttribute('download', baseFilename + fileExtension);
 
@@ -183,11 +165,9 @@ processButton.addEventListener('click', async () => {
     }
 });
 
-// Initialize UI
 window.addEventListener('DOMContentLoaded', () => {
     ratioValue.textContent = ratioInput.value;
 
-    // Add tooltip for transcript mode
     const transcriptOption = document.querySelector('input[value="transcript"]').parentElement;
     transcriptOption.title = "Use this mode for podcast transcripts, interviews, or dialogue-heavy content";
 });

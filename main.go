@@ -7,9 +7,9 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"pdf-processor/internal/chunker"
-	"pdf-processor/internal/config"
-	"pdf-processor/internal/workers"
+	"pdf-processor/pkg/chunker"
+	"pdf-processor/pkg/config"
+	"pdf-processor/pkg/workers"
 	"strconv"
 	"strings"
 	"time"
@@ -47,20 +47,19 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 		startTime := time.Now()
 		log.Printf("\n\n=== NEW REQUEST ===")
 		log.Printf("From: %s | Method: %s", r.RemoteAddr, r.Method)
-		defer log.Printf("=== REQUEST COMPLETED IN %v ===\n", time.Since(startTime))
+		defer func() {
+			log.Printf("=== REQUEST COMPLETED IN %v ===\n", time.Since(startTime))
+		}()
 
-		// 1. PARSE FORM FIRST
 		if err := r.ParseForm(); err != nil {
 			log.Printf("FORM PARSE ERROR: %v", err)
 			http.Error(w, "Invalid form data", http.StatusBadRequest)
 			return
 		}
 
-		// 2. LOG RAW FORM DATA IMMEDIATELY AFTER PARSING
-		log.Printf("RAW FORM VALUES: %+v", r.Form) // Add this line
+		log.Printf("RAW FORM VALUES: %+v", r.Form)
 		log.Printf("HEADERS: %+v", r.Header)
 
-		// 3. GET FORM VALUES WITH FALLBACKS
 		text := r.FormValue("text")
 		ratioStr := r.FormValue("ratio")
 		mode := r.FormValue("mode")
@@ -68,7 +67,6 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 		log.Printf("RECEIVED PARAMS | TextLen: %d | Ratio: %s | Mode: '%s'",
 			len(text), ratioStr, mode)
 
-		// 4. VALIDATION
 		if text == "" {
 			log.Printf("VALIDATION FAILED: Empty text")
 			http.Error(w, "Text field is missing", http.StatusBadRequest)
@@ -82,7 +80,6 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		// 5. MODE HANDLING
 		if mode == "" {
 			mode = "document"
 			log.Printf("MODE FALLBACK: Using default '%s'", mode)
@@ -96,7 +93,6 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		// 6. PROCESSING
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
 
@@ -126,16 +122,13 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			results = workers.ProcessChunks(ctx, chunks, cfg, ratio, "document")
 		}
 
-		// 7. RESPONSE
 		combinedResult := combineResults(results)
 		outputWordCount := len(strings.Fields(combinedResult))
 		log.Printf("RESPONSE READY | Input: %d words | Output: %d words | Reduction: %.1f%%",
 			inputWordCount, outputWordCount,
 			100.0-(float64(outputWordCount)/float64(inputWordCount))*100.0)
 
-		// Check if the output should be PDF or text
 		if strings.Contains(combinedResult, "# ") {
-			// Contains markdown headings, return as PDF
 			w.Header().Set("Content-Type", "application/pdf")
 			w.Header().Set("Content-Disposition", "attachment; filename=processed.pdf")
 
@@ -145,7 +138,6 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 				return
 			}
 		} else {
-			// No markdown headings, return as text
 			w.Header().Set("Content-Type", "text/plain")
 			io.WriteString(w, combinedResult)
 		}
@@ -163,30 +155,23 @@ func combineResults(results []string) string {
 	return final.String()
 }
 
-// markdownToPDF converts markdown text to PDF and writes to the provided writer
 func markdownToPDF(markdown string, w io.Writer) error {
-	// Parse markdown to HTML
 	html := blackfriday.Run([]byte(markdown))
 
-	// Create a new PDF document
 	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.SetMargins(20, 20, 20) // Set margins for better readability
+	pdf.SetMargins(20, 20, 20)
 	pdf.AddPage()
 
-	// Add a title
 	pdf.SetFont("Arial", "B", 18)
 	pdf.Cell(0, 10, "Processed Document")
 	pdf.Ln(15)
 
-	// Process the HTML content
 	lines := strings.Split(string(html), "\n")
 	inParagraph := false
 	paragraphText := ""
 
 	for _, line := range lines {
-		// Handle headings (# Heading)
 		if strings.Contains(line, "<h1>") {
-			// If we were in a paragraph, finish it first
 			if inParagraph {
 				pdf.SetFont("Arial", "", 12)
 				pdf.MultiCell(0, 6, paragraphText, "", "", false)
@@ -200,7 +185,6 @@ func markdownToPDF(markdown string, w io.Writer) error {
 			pdf.Cell(0, 10, heading)
 			pdf.Ln(10)
 		} else if strings.Contains(line, "<h2>") {
-			// If we were in a paragraph, finish it first
 			if inParagraph {
 				pdf.SetFont("Arial", "", 12)
 				pdf.MultiCell(0, 6, paragraphText, "", "", false)
@@ -214,7 +198,6 @@ func markdownToPDF(markdown string, w io.Writer) error {
 			pdf.Cell(0, 10, heading)
 			pdf.Ln(8)
 		} else if strings.Contains(line, "<h3>") {
-			// If we were in a paragraph, finish it first
 			if inParagraph {
 				pdf.SetFont("Arial", "", 12)
 				pdf.MultiCell(0, 6, paragraphText, "", "", false)
@@ -228,7 +211,6 @@ func markdownToPDF(markdown string, w io.Writer) error {
 			pdf.Cell(0, 10, heading)
 			pdf.Ln(8)
 		} else if strings.Contains(line, "<p>") {
-			// Regular paragraph text
 			text := stripTags(line)
 			if text != "" {
 				if !inParagraph {
@@ -239,7 +221,6 @@ func markdownToPDF(markdown string, w io.Writer) error {
 				}
 			}
 		} else if line == "" && inParagraph {
-			// End of paragraph
 			pdf.SetFont("Arial", "", 12)
 			pdf.MultiCell(0, 6, paragraphText, "", "", false)
 			pdf.Ln(5)
@@ -248,13 +229,11 @@ func markdownToPDF(markdown string, w io.Writer) error {
 		}
 	}
 
-	// If we're still in a paragraph at the end, finish it
 	if inParagraph {
 		pdf.SetFont("Arial", "", 12)
 		pdf.MultiCell(0, 6, paragraphText, "", "", false)
 	}
 
-	// Add page numbers
 	pageCount := pdf.PageCount()
 	for i := 1; i <= pageCount; i++ {
 		pdf.SetPage(i)
@@ -263,11 +242,9 @@ func markdownToPDF(markdown string, w io.Writer) error {
 		pdf.CellFormat(0, 10, fmt.Sprintf("Page %d of %d", i, pageCount), "", 0, "C", false, 0, "")
 	}
 
-	// Write the PDF to the output writer
 	return pdf.Output(w)
 }
 
-// stripTags removes HTML tags from a string
 func stripTags(html string) string {
 	var buf bytes.Buffer
 	var inTag bool

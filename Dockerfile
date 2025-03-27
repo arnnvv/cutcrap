@@ -1,13 +1,18 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24.1-alpine3.21 as builder
+
+RUN apk add --no-cache git
 WORKDIR /app
-COPY . .
+COPY go.mod go.sum ./
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -o pdf-processor ./cmd/api
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux \
+    go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o api
 
-FROM alpine:latest
-WORKDIR /app
-COPY --from=builder /app/pdf-processor .
-COPY .env.example .env
-EXPOSE 8080
-CMD ["./pdf-processor"]
-
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder --chmod=0755 /app/api /api
+USER nonroot:nonroot
+ENTRYPOINT ["/api"]
