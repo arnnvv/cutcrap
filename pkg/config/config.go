@@ -5,8 +5,6 @@ import (
 	"os"
 	"strconv"
 	"time"
-
-	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -15,22 +13,17 @@ type Config struct {
 	MaxConcurrent  int
 	RequestTimeout time.Duration
 	ChunkSize      int
-	ChunkOverlap   int // New field for transcript processing
+	ChunkOverlap   int
+	Pdf_api        string
 }
 
 func Load() *Config {
 	log.Println("Loading configuration from environment")
 
-	// Load .env file if it exists
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: .env file not found or couldn't be loaded: %v", err)
-	} else {
-		log.Println("Successfully loaded .env file")
-	}
-
 	port := getEnv("PORT", "8080")
 	log.Printf("PORT: %s", port)
 
+	pdf_api := getEnv("PDF_API", "")
 	apiKey := getEnv("OPENROUTER_API_KEY", "")
 	if apiKey == "" {
 		log.Printf("WARNING: OPENROUTER_API_KEY not set")
@@ -47,7 +40,6 @@ func Load() *Config {
 	chunkSize := getEnvAsInt("CHUNK_SIZE", 900)
 	log.Printf("CHUNK_SIZE: %d", chunkSize)
 
-	// New configuration for transcript processing
 	chunkOverlap := getEnvAsInt("CHUNK_OVERLAP", 100)
 	log.Printf("CHUNK_OVERLAP: %d", chunkOverlap)
 
@@ -58,10 +50,10 @@ func Load() *Config {
 		RequestTimeout: requestTimeout,
 		ChunkSize:      chunkSize,
 		ChunkOverlap:   chunkOverlap,
+		Pdf_api:        pdf_api,
 	}
 }
 
-// getEnv retrieves environment variable or returns default value if not set
 func getEnv(key, defaultValue string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -71,7 +63,6 @@ func getEnv(key, defaultValue string) string {
 	return value
 }
 
-// getEnvAsInt retrieves environment variable as integer or returns default value
 func getEnvAsInt(key string, defaultValue int) int {
 	valueStr := getEnv(key, "")
 	if valueStr == "" {
@@ -86,7 +77,6 @@ func getEnvAsInt(key string, defaultValue int) int {
 	return value
 }
 
-// getEnvAsDuration retrieves environment variable as duration or returns default value
 func getEnvAsDuration(key string, defaultValue time.Duration) time.Duration {
 	valueStr := getEnv(key, "")
 	if valueStr == "" {

@@ -1,21 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"pdf-processor/pkg/chunker"
-	"pdf-processor/pkg/config"
-	"pdf-processor/pkg/workers"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/jung-kurt/gofpdf"
-	"github.com/russross/blackfriday/v2"
+	"github.com/arnnvv/cutcrap/pkg/chunker"
+	"github.com/arnnvv/cutcrap/pkg/config"
+	"github.com/arnnvv/cutcrap/pkg/workers"
 )
 
 func enableCors(w *http.ResponseWriter) {
@@ -153,115 +149,4 @@ func combineResults(results []string) string {
 		}
 	}
 	return final.String()
-}
-
-func markdownToPDF(markdown string, w io.Writer) error {
-	html := blackfriday.Run([]byte(markdown))
-
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.SetMargins(20, 20, 20)
-	pdf.AddPage()
-
-	pdf.SetFont("Arial", "B", 18)
-	pdf.Cell(0, 10, "Processed Document")
-	pdf.Ln(15)
-
-	lines := strings.Split(string(html), "\n")
-	inParagraph := false
-	paragraphText := ""
-
-	for _, line := range lines {
-		if strings.Contains(line, "<h1>") {
-			if inParagraph {
-				pdf.SetFont("Arial", "", 12)
-				pdf.MultiCell(0, 6, paragraphText, "", "", false)
-				pdf.Ln(5)
-				inParagraph = false
-				paragraphText = ""
-			}
-
-			heading := stripTags(line)
-			pdf.SetFont("Arial", "B", 16)
-			pdf.Cell(0, 10, heading)
-			pdf.Ln(10)
-		} else if strings.Contains(line, "<h2>") {
-			if inParagraph {
-				pdf.SetFont("Arial", "", 12)
-				pdf.MultiCell(0, 6, paragraphText, "", "", false)
-				pdf.Ln(5)
-				inParagraph = false
-				paragraphText = ""
-			}
-
-			heading := stripTags(line)
-			pdf.SetFont("Arial", "B", 14)
-			pdf.Cell(0, 10, heading)
-			pdf.Ln(8)
-		} else if strings.Contains(line, "<h3>") {
-			if inParagraph {
-				pdf.SetFont("Arial", "", 12)
-				pdf.MultiCell(0, 6, paragraphText, "", "", false)
-				pdf.Ln(5)
-				inParagraph = false
-				paragraphText = ""
-			}
-
-			heading := stripTags(line)
-			pdf.SetFont("Arial", "BI", 12)
-			pdf.Cell(0, 10, heading)
-			pdf.Ln(8)
-		} else if strings.Contains(line, "<p>") {
-			text := stripTags(line)
-			if text != "" {
-				if !inParagraph {
-					inParagraph = true
-					paragraphText = text
-				} else {
-					paragraphText += " " + text
-				}
-			}
-		} else if line == "" && inParagraph {
-			pdf.SetFont("Arial", "", 12)
-			pdf.MultiCell(0, 6, paragraphText, "", "", false)
-			pdf.Ln(5)
-			inParagraph = false
-			paragraphText = ""
-		}
-	}
-
-	if inParagraph {
-		pdf.SetFont("Arial", "", 12)
-		pdf.MultiCell(0, 6, paragraphText, "", "", false)
-	}
-
-	pageCount := pdf.PageCount()
-	for i := 1; i <= pageCount; i++ {
-		pdf.SetPage(i)
-		pdf.SetY(-15)
-		pdf.SetFont("Arial", "I", 8)
-		pdf.CellFormat(0, 10, fmt.Sprintf("Page %d of %d", i, pageCount), "", 0, "C", false, 0, "")
-	}
-
-	return pdf.Output(w)
-}
-
-func stripTags(html string) string {
-	var buf bytes.Buffer
-	var inTag bool
-
-	for _, r := range html {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			continue
-		}
-		if !inTag {
-			buf.WriteRune(r)
-		}
-	}
-
-	return strings.TrimSpace(buf.String())
 }

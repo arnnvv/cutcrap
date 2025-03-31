@@ -3,13 +3,14 @@ package workers
 import (
 	"context"
 	"log"
-	"pdf-processor/pkg/api"
-	"pdf-processor/pkg/chunker"
-	"pdf-processor/pkg/config"
-	"pdf-processor/pkg/transcript"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/arnnvv/cutcrap/pkg/api"
+	"github.com/arnnvv/cutcrap/pkg/chunker"
+	"github.com/arnnvv/cutcrap/pkg/config"
+	"github.com/arnnvv/cutcrap/pkg/transcript"
 )
 
 func ProcessChunks(ctx context.Context, chunks []string, cfg *config.Config, ratio float64, mode string) []string {

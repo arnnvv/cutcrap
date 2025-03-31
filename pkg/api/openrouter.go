@@ -38,17 +38,14 @@ type GeminiResponse struct {
 	ModelVersion string `json:"modelVersion"`
 }
 
-// ProcessText processes text using Gemini API with document mode prompt
 func ProcessText(ctx context.Context, text, apiKey string, targetWordCount int) (string, error) {
 	return processTextWithMode(ctx, text, apiKey, targetWordCount, "document")
 }
 
-// ProcessTranscript processes text using Gemini API with transcript mode prompt
 func ProcessTranscript(ctx context.Context, text, apiKey string, targetWordCount int) (string, error) {
 	return processTextWithMode(ctx, text, apiKey, targetWordCount, "transcript")
 }
 
-// processTextWithMode handles both document and transcript processing modes
 func processTextWithMode(ctx context.Context, text, apiKey string, targetWordCount int, mode string) (string, error) {
 	startTime := time.Now()
 	inputWordCount := len(strings.Fields(text))
@@ -57,7 +54,7 @@ func processTextWithMode(ctx context.Context, text, apiKey string, targetWordCou
 
 	var prompt string
 	if mode == "transcript" {
-		prompt = fmt.Sprintf(`You are processing a chunk of subtitles from a YouTube podcast. Format this text as a clean, readable transcript with the following rules:
+		prompt = `You are processing a chunk of subtitles from a YouTube podcast. Format this text as a clean, readable transcript with the following rules:
 
     Clearly identify speakers as either "Guest:" or "Host:" based on context clues and speech patterns.
 
@@ -70,9 +67,8 @@ Format the output exactly like this:
 Guest: [exact simplified speech]
 Host: [exact simplified speech]
 
-Important: Return ONLY the formatted transcript without any introductions, explanations, summaries, or additional comments.`)
+Important: Return ONLY the formatted transcript without any introductions, explanations, summaries, or additional comments.`
 	} else {
-		// Original document mode prompt
 		prompt = fmt.Sprintf(`Condense this text to exactly exactly %d words while:
 - Preserving all key plot points and essential information and data.
 - Removing redundant descriptions and unnecessary elaborations
@@ -83,8 +79,8 @@ Important: Return ONLY the formatted transcript without any introductions, expla
 Important: Return ONLY the condensed text without any introductions, explanations, or summaries. Do not include phrases like "Here's the condensed version" or "In summary". Just provide the rewritten text directly.`, targetWordCount)
 	}
 
-	payload := map[string]interface{}{
-		"contents": []map[string]interface{}{
+	payload := map[string]any{
+		"contents": []map[string]any{
 			{
 				"parts": []map[string]string{
 					{
