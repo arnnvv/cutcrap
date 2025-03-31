@@ -119,13 +119,13 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			fileWriter, err := mpWriter.CreateFormFile("file", "processed.md")
 			if err != nil {
 				log.Printf("PDF API FORM CREATION FAILED: %v", err)
-				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				http.Error(w, "PDF generation failed 1", http.StatusInternalServerError)
 				return
 			}
 
 			if _, err := fileWriter.Write([]byte(combinedResult)); err != nil {
 				log.Printf("PDF API WRITE FAILED: %v", err)
-				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				http.Error(w, "PDF generation failed 2", http.StatusInternalServerError)
 				return
 			}
 			mpWriter.Close()
@@ -133,7 +133,7 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			req, err := http.NewRequestWithContext(ctx, "POST", cfg.Pdf_api, &body)
 			if err != nil {
 				log.Printf("PDF API REQUEST CREATION FAILED: %v", err)
-				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				http.Error(w, "PDF generation failed 3", http.StatusInternalServerError)
 				return
 			}
 			req.Header.Set("Content-Type", mpWriter.FormDataContentType())
@@ -142,20 +142,20 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			resp, err := client.Do(req)
 			if err != nil {
 				log.Printf("PDF API REQUEST FAILED: %v", err)
-				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				http.Error(w, "PDF generation failed 4", http.StatusInternalServerError)
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
 				log.Printf("PDF API RETURNED STATUS: %d", resp.StatusCode)
-				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				http.Error(w, "PDF generation failed 5", http.StatusInternalServerError)
 				return
 			}
 
 			if _, err := io.Copy(w, resp.Body); err != nil {
 				log.Printf("PDF STREAM FAILED: %v", err)
-				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				http.Error(w, "PDF generation failed 6", http.StatusInternalServerError)
 				return
 			}
 		} else {
