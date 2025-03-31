@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,7 +25,7 @@ func enableCors(w *http.ResponseWriter) {
 func main() {
 	log.Println("Starting PDF processor service")
 	cfg := config.Load()
-	log.Printf("Configuration loaded: Port=%s, MaxConcurrent=%d, ChunkSize=%d", cfg.Port, cfg.MaxConcurrent, cfg.ChunkSize)
+	log.Printf("Configuration loaded: Port=%s, MaxConcurrent=%d, ChunkSize=%d, PdfApi=%s", cfg.Port, cfg.MaxConcurrent, cfg.ChunkSize, cfg.Pdf_api)
 
 	http.HandleFunc("/process", func(w http.ResponseWriter, r *http.Request) {
 		enableCors(&w)
@@ -53,15 +55,9 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		log.Printf("RAW FORM VALUES: %+v", r.Form)
-		log.Printf("HEADERS: %+v", r.Header)
-
 		text := r.FormValue("text")
 		ratioStr := r.FormValue("ratio")
 		mode := r.FormValue("mode")
-
-		log.Printf("RECEIVED PARAMS | TextLen: %d | Ratio: %s | Mode: '%s'",
-			len(text), ratioStr, mode)
 
 		if text == "" {
 			log.Printf("VALIDATION FAILED: Empty text")
@@ -78,13 +74,9 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 
 		if mode == "" {
 			mode = "document"
-			log.Printf("MODE FALLBACK: Using default '%s'", mode)
-		} else {
-			log.Printf("MODE SELECTED: %s", mode)
 		}
 
 		if mode != "document" && mode != "transcript" {
-			log.Printf("INVALID MODE: %s", mode)
 			http.Error(w, "Invalid mode value", http.StatusBadRequest)
 			return
 		}
@@ -97,24 +89,18 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 
 		var results []string
 		if mode == "transcript" {
-			log.Printf("TRANSCRIPT PROCESSING | ChunkSize: %d | Overlap: %d",
-				cfg.ChunkSize, cfg.ChunkOverlap)
 			result := workers.ProcessTranscript(ctx, text, cfg, ratio)
 			if result == "" {
-				log.Printf("TRANSCRIPT FAILURE: No results")
 				http.Error(w, "Transcript processing failed", http.StatusInternalServerError)
 				return
 			}
 			results = []string{result}
 		} else {
-			log.Printf("DOCUMENT PROCESSING | ChunkSize: %d", cfg.ChunkSize)
 			chunks, err := chunker.ChunkText(text, cfg.ChunkSize)
 			if err != nil {
-				log.Printf("CHUNKING FAILURE: %v", err)
 				http.Error(w, "Text chunking failed", http.StatusInternalServerError)
 				return
 			}
-			log.Printf("DOCUMENT CHUNKED | Parts: %d", len(chunks))
 			results = workers.ProcessChunks(ctx, chunks, cfg, ratio, "document")
 		}
 
@@ -128,8 +114,47 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/pdf")
 			w.Header().Set("Content-Disposition", "attachment; filename=processed.pdf")
 
-			if err := markdownToPDF(combinedResult, w); err != nil {
-				log.Printf("PDF CONVERSION FAILED: %v", err)
+			var body bytes.Buffer
+			mpWriter := multipart.NewWriter(&body)
+			fileWriter, err := mpWriter.CreateFormFile("file", "processed.md")
+			if err != nil {
+				log.Printf("PDF API FORM CREATION FAILED: %v", err)
+				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				return
+			}
+
+			if _, err := fileWriter.Write([]byte(combinedResult)); err != nil {
+				log.Printf("PDF API WRITE FAILED: %v", err)
+				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				return
+			}
+			mpWriter.Close()
+
+			req, err := http.NewRequestWithContext(ctx, "POST", cfg.Pdf_api, &body)
+			if err != nil {
+				log.Printf("PDF API REQUEST CREATION FAILED: %v", err)
+				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				return
+			}
+			req.Header.Set("Content-Type", mpWriter.FormDataContentType())
+
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("PDF API REQUEST FAILED: %v", err)
+				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("PDF API RETURNED STATUS: %d", resp.StatusCode)
+				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
+				return
+			}
+
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				log.Printf("PDF STREAM FAILED: %v", err)
 				http.Error(w, "PDF generation failed", http.StatusInternalServerError)
 				return
 			}
