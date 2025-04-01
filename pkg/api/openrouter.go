@@ -93,7 +93,7 @@ Important: Return ONLY the condensed text without any introductions, explanation
 
 	body, _ := json.Marshal(payload)
 	log.Printf("Preparing API request to Gemini API with model gemini-2.0-flash")
-	req, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", apiKey), bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-exp-03-25:generateContent?key="+apiKey, bytes.NewReader(body))
 
 	req.Header.Set("Content-Type", "application/json")
 
