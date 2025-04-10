@@ -2,6 +2,7 @@ Directory structure:
 └── cutcrap/
     ├── Dockerfile
     ├── go.mod
+    ├── go.sum
     ├── main.go
     ├── .dockerignore
     ├── .env.example
@@ -52,6 +53,16 @@ module github.com/arnnvv/cutcrap
 
 go 1.24.1
 
+require github.com/joho/godotenv v1.5.1
+
+
+
+================================================
+File: go.sum
+================================================
+github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
+github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
+
 
 
 ================================================
@@ -73,15 +84,24 @@ import (
 	"github.com/arnnvv/cutcrap/pkg/chunker"
 	"github.com/arnnvv/cutcrap/pkg/config"
 	"github.com/arnnvv/cutcrap/pkg/workers"
+
+	"github.com/joho/godotenv" // Keep if using .env loading
 )
 
 func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Origin", "*")
 	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// Make sure Content-Type is allowed if you have specific checks
+	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With") // Example broader set
 }
 
 func main() {
+	// Load .env file if you added godotenv
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("No .env file found or error loading .env file, using system env vars")
+	}
+
 	log.Println("Starting PDF processor service")
 	cfg := config.Load()
 	log.Printf("Configuration loaded: Port=%s, MaxConcurrent=%d, ChunkSize=%d, PdfApi=%s", cfg.Port, cfg.MaxConcurrent, cfg.ChunkSize, cfg.Pdf_api)
@@ -92,6 +112,7 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		// Use the modified uploadHandler
 		uploadHandler(cfg)(w, r)
 	})
 
@@ -103,40 +124,56 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 		log.Printf("\n\n=== NEW REQUEST ===")
-		log.Printf("From: %s | Method: %s", r.RemoteAddr, r.Method)
+		log.Printf("From: %s | Method: %s | Content-Type: %s", r.RemoteAddr, r.Method, r.Header.Get("Content-Type")) // Log Content-Type
 		defer func() {
 			log.Printf("=== REQUEST COMPLETED IN %v ===\n", time.Since(startTime))
 		}()
 
-		if err := r.ParseForm(); err != nil {
-			log.Printf("FORM PARSE ERROR: %v", err)
-			http.Error(w, "Invalid form data", http.StatusBadRequest)
+		// *** CHANGE HERE: Use ParseMultipartForm instead of ParseForm ***
+		// Set a max memory limit (e.g., 32 MB) for parts stored in memory.
+		// Larger parts will be stored on disk. Adjust as needed.
+		const maxMemory = 32 << 20 // 32 MB
+		if err := r.ParseMultipartForm(maxMemory); err != nil {
+			log.Printf("MULTIPART FORM PARSE ERROR: %v", err)
+			// Check if it's because the Content-Type wasn't multipart
+			if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+				http.Error(w, "Invalid request format: Expected multipart/form-data", http.StatusBadRequest)
+			} else {
+				http.Error(w, "Invalid form data", http.StatusBadRequest)
+			}
 			return
 		}
+		// ***************************************************************
 
+		// You can still use r.FormValue after ParseMultipartForm is called successfully
 		text := r.FormValue("text")
 		ratioStr := r.FormValue("ratio")
 		mode := r.FormValue("mode")
 
+		log.Printf("Received Form Data: text(len)=%d, ratio='%s', mode='%s'", len(text), ratioStr, mode) // Add log to see received values
+
 		if text == "" {
-			log.Printf("VALIDATION FAILED: Empty text")
-			http.Error(w, "Text field is missing", http.StatusBadRequest)
+			log.Printf("VALIDATION FAILED: Empty text field received") // Updated log message
+			http.Error(w, "Text field is missing or empty", http.StatusBadRequest)
 			return
 		}
 
 		ratio, err := strconv.ParseFloat(ratioStr, 64)
+		// Ratio check should be <= 0 (or perhaps a small positive epsilon like 0.01)
 		if err != nil || ratio <= 0 || ratio > 1 {
-			log.Printf("VALIDATION FAILED: Invalid ratio %v", ratioStr)
-			http.Error(w, "Invalid ratio value", http.StatusBadRequest)
+			log.Printf("VALIDATION FAILED: Invalid ratio '%v'", ratioStr)
+			http.Error(w, "Invalid ratio value (must be > 0 and <= 1)", http.StatusBadRequest)
 			return
 		}
 
 		if mode == "" {
-			mode = "document"
+			log.Printf("VALIDATION FAILED: Mode field is missing, defaulting to 'document'")
+			mode = "document" // Defaulting might be okay, but log it
 		}
 
 		if mode != "document" && mode != "transcript" {
-			http.Error(w, "Invalid mode value", http.StatusBadRequest)
+			log.Printf("VALIDATION FAILED: Invalid mode value '%s'", mode)
+			http.Error(w, "Invalid mode value (must be 'document' or 'transcript')", http.StatusBadRequest)
 			return
 		}
 
@@ -144,91 +181,155 @@ func uploadHandler(cfg *config.Config) http.HandlerFunc {
 		defer cancel()
 
 		inputWordCount := len(strings.Fields(text))
-		log.Printf("PROCESSING START | Mode: %s | Words: %d", mode, inputWordCount)
+		log.Printf("PROCESSING START | Mode: %s | Words: %d | Ratio: %.2f", mode, inputWordCount, ratio)
 
 		var results []string
+		var combinedResult string // Declare outside the if/else
+
 		if mode == "transcript" {
 			result := workers.ProcessTranscript(ctx, text, cfg, ratio)
+			// Check for actual processing error if result is empty
 			if result == "" {
-				http.Error(w, "Transcript processing failed", http.StatusInternalServerError)
-				return
+				// It's possible the processing itself returned empty, not necessarily an internal server error.
+				// Check context cancellation or specific errors if available.
+				if ctx.Err() != nil {
+					log.Printf("Transcript processing failed due to context error: %v", ctx.Err())
+					http.Error(w, "Transcript processing timed out or was cancelled", http.StatusRequestTimeout)
+
+				} else {
+					log.Printf("Transcript processing returned an empty result.")
+					// Decide if empty result is an error or valid outcome. Assuming valid for now.
+					combinedResult = "" // Explicitly set to empty
+				}
+
+			} else {
+				results = []string{result}
+				combinedResult = combineResults(results)
 			}
-			results = []string{result}
-		} else {
+		} else { // document mode
 			chunks, err := chunker.ChunkText(text, cfg.ChunkSize)
 			if err != nil {
+				log.Printf("Text chunking failed: %v", err)
 				http.Error(w, "Text chunking failed", http.StatusInternalServerError)
 				return
 			}
-			results = workers.ProcessChunks(ctx, chunks, cfg, ratio, "document")
+			// Inside the uploadHandler function, within the 'else' block for document mode:
+			results = workers.ProcessChunks(ctx, chunks, cfg, ratio, "document", "") // Add empty string for speakerAnalysis
+			// Check context error after processing chunks
+			if ctx.Err() != nil {
+				log.Printf("Chunk processing failed due to context error: %v", ctx.Err())
+				http.Error(w, "Document processing timed out or was cancelled", http.StatusRequestTimeout)
+				return
+			}
+			combinedResult = combineResults(results)
 		}
 
-		combinedResult := combineResults(results)
-		outputWordCount := len(strings.Fields(combinedResult))
-		log.Printf("RESPONSE READY | Input: %d words | Output: %d words | Reduction: %.1f%%",
-			inputWordCount, outputWordCount,
-			100.0-(float64(outputWordCount)/float64(inputWordCount))*100.0)
-
-		if strings.Contains(combinedResult, "# ") {
-			w.Header().Set("Content-Type", "application/pdf")
-			w.Header().Set("Content-Disposition", "attachment; filename=processed.pdf")
-
-			var body bytes.Buffer
-			mpWriter := multipart.NewWriter(&body)
-			fileWriter, err := mpWriter.CreateFormFile("file", "processed.md")
-			if err != nil {
-				log.Printf("PDF API FORM CREATION FAILED: %v", err)
-				http.Error(w, "PDF generation failed 1", http.StatusInternalServerError)
-				return
+		// Only proceed to response if context is still valid
+		if ctx.Err() == nil {
+			outputWordCount := len(strings.Fields(combinedResult))
+			reduction := 0.0
+			if inputWordCount > 0 {
+				reduction = 100.0 - (float64(outputWordCount)/float64(inputWordCount))*100.0
 			}
+			log.Printf("RESPONSE READY | Input: %d words | Output: %d words | Reduction: %.1f%%",
+				inputWordCount, outputWordCount, reduction)
 
-			if _, err := fileWriter.Write([]byte(combinedResult)); err != nil {
-				log.Printf("PDF API WRITE FAILED: %v", err)
-				http.Error(w, "PDF generation failed 2", http.StatusInternalServerError)
-				return
-			}
-			mpWriter.Close()
+			// Check if PDF generation is requested and possible
+			// The check for "# " might be too simplistic. Maybe rely on mode?
+			// Or add a specific request parameter/header if PDF is desired?
+			// Let's assume for now: PDF only if document mode AND headings found AND PDF_API is set.
+			shouldGeneratePdf := mode == "document" && cfg.Pdf_api != "" && strings.Contains(combinedResult, "# ")
 
-			req, err := http.NewRequestWithContext(ctx, "POST", cfg.Pdf_api, &body)
-			if err != nil {
-				log.Printf("PDF API REQUEST CREATION FAILED: %v", err)
-				http.Error(w, "PDF generation failed 3", http.StatusInternalServerError)
-				return
-			}
-			req.Header.Set("Content-Type", mpWriter.FormDataContentType())
+			if shouldGeneratePdf {
+				log.Printf("Attempting PDF generation via API: %s", cfg.Pdf_api)
+				w.Header().Set("Content-Type", "application/pdf")
+				// Use a more descriptive filename
+				w.Header().Set("Content-Disposition", "attachment; filename=processed_document.pdf")
 
-			client := &http.Client{}
-			resp, err := client.Do(req)
-			if err != nil {
-				log.Printf("PDF API REQUEST FAILED: %v", err)
-				http.Error(w, "PDF generation failed 4", http.StatusInternalServerError)
-				return
-			}
-			defer resp.Body.Close()
+				var body bytes.Buffer
+				mpWriter := multipart.NewWriter(&body)
+				// Use a more appropriate filename for the markdown content
+				fileWriter, err := mpWriter.CreateFormFile("file", "content.md")
+				if err != nil {
+					log.Printf("PDF API FORM CREATION FAILED: %v", err)
+					http.Error(w, "PDF generation setup failed", http.StatusInternalServerError)
+					return
+				}
 
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("PDF API RETURNED STATUS: %d", resp.StatusCode)
-				http.Error(w, "PDF generation failed 5", http.StatusInternalServerError)
-				return
-			}
+				if _, err := fileWriter.Write([]byte(combinedResult)); err != nil {
+					log.Printf("PDF API WRITE FAILED: %v", err)
+					http.Error(w, "PDF generation content write failed", http.StatusInternalServerError)
+					return
+				}
+				mpWriter.Close() // Must close before reading body or setting content type
 
-			if _, err := io.Copy(w, resp.Body); err != nil {
-				log.Printf("PDF STREAM FAILED: %v", err)
-				http.Error(w, "PDF generation failed 6", http.StatusInternalServerError)
-				return
+				req, err := http.NewRequestWithContext(ctx, "POST", cfg.Pdf_api, &body)
+				if err != nil {
+					log.Printf("PDF API REQUEST CREATION FAILED: %v", err)
+					http.Error(w, "PDF generation request creation failed", http.StatusInternalServerError)
+					return
+				}
+				// Set the correct multipart content type for the PDF API request
+				req.Header.Set("Content-Type", mpWriter.FormDataContentType())
+
+				// Use a client with a timeout relevant to PDF generation
+				client := &http.Client{Timeout: 2 * time.Minute}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("PDF API REQUEST FAILED: %v", err)
+					http.Error(w, "PDF generation request failed", http.StatusInternalServerError)
+					return
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode != http.StatusOK {
+					respBodyBytes, _ := io.ReadAll(resp.Body) // Try to read error body
+					log.Printf("PDF API RETURNED STATUS: %d. Body: %s", resp.StatusCode, string(respBodyBytes))
+					http.Error(w, "PDF generation failed on external API", http.StatusInternalServerError)
+					return
+				}
+
+				// Stream the PDF response back to the original client
+				if _, err := io.Copy(w, resp.Body); err != nil {
+					log.Printf("PDF STREAM FAILED: %v", err)
+					// Don't send another http.Error if header is already sent
+					// http.Error(w, "Failed to stream PDF response", http.StatusInternalServerError)
+					return
+				}
+			} else {
+				// Default to plain text if not generating PDF
+				log.Printf("Sending response as plain text.")
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				// Set appropriate filename for text download
+				if mode == "transcript" {
+					w.Header().Set("Content-Disposition", "attachment; filename=processed_transcript.txt")
+				} else {
+					w.Header().Set("Content-Disposition", "attachment; filename=processed_document.txt")
+				}
+				io.WriteString(w, combinedResult)
 			}
-		} else {
-			w.Header().Set("Content-Type", "text/plain")
-			io.WriteString(w, combinedResult)
-		}
+		} // End check for ctx.Err() == nil
+
 	}
 }
 
+// combineResults remains the same
 func combineResults(results []string) string {
+	// Filter out empty strings that might result from failed chunk processing
+	var validResults []string
+	for _, res := range results {
+		if res != "" {
+			validResults = append(validResults, res)
+		}
+	}
+
 	var final strings.Builder
-	for i, res := range results {
+	for i, res := range validResults {
 		final.WriteString(res)
-		if i < len(results)-1 {
+		// Add separator only between valid chunks
+		if i < len(validResults)-1 {
+			// Use a single newline for transcript mode for tighter formatting?
+			// Or keep double newline for both for consistency? Let's keep double for now.
 			final.WriteString("\n\n")
 		}
 	}
@@ -272,12 +373,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 )
 
+// GeminiResponse struct remains the same
 type GeminiResponse struct {
 	Candidates []struct {
 		Content struct {
@@ -293,27 +396,109 @@ type GeminiResponse struct {
 		PromptTokenCount     int `json:"promptTokenCount"`
 		CandidatesTokenCount int `json:"candidatesTokenCount"`
 		TotalTokenCount      int `json:"totalTokenCount"`
-		PromptTokensDetails  []struct {
-			Modality   string `json:"modality"`
-			TokenCount int    `json:"tokenCount"`
-		} `json:"promptTokensDetails"`
-		CandidatesTokensDetails []struct {
-			Modality   string `json:"modality"`
-			TokenCount int    `json:"tokenCount"`
-		} `json:"candidatesTokensDetails"`
+		// ... rest of UsageMetadata fields
 	} `json:"usageMetadata"`
 	ModelVersion string `json:"modelVersion"`
 }
 
-func ProcessText(ctx context.Context, text, apiKey string, targetWordCount int) (string, error) {
-	return processTextWithMode(ctx, text, apiKey, targetWordCount, "document")
+// --- NEW FUNCTION for Speaker Analysis ---
+func AnalyzeSpeakers(ctx context.Context, fullText, apiKey string) (string, error) {
+	startTime := time.Now()
+	log.Printf("Starting speaker analysis for text of %d words", len(strings.Fields(fullText)))
+
+	// Carefully craft the prompt for analysis
+	analysisPrompt := `Analyze the following podcast transcript to identify the speakers. Provide the following information in a clear, concise list format:
+1. Total number of distinct speakers detected.
+2. Identify the HOST (usually the one asking questions, leading the conversation, or doing intros/outros). Provide their name if clearly mentioned.
+3. Identify the GUEST(s). Provide their names if clearly mentioned. If multiple guests, list them as Guest 1, Guest 2, etc.
+4. For each speaker (Host and Guests), provide a brief 1-sentence description of their apparent role or topic focus if discernible from the text.
+
+Focus ONLY on information present in the transcript. Do not guess information not present.
+
+Transcript:
+--- TRANSCRIPT START ---
+%s
+--- TRANSCRIPT END ---
+
+Return ONLY the analysis result using this exact format:
+- Total Speakers: [Number]
+- Host: [Name or "Host"], [Brief Description]
+- Guest 1: [Name or "Guest 1"], [Brief Description]
+- Guest 2: [Name or "Guest 2"], [Brief Description]
+... (continue for all detected guests)`
+
+	payload := map[string]any{
+		"contents": []map[string]any{
+			{
+				"parts": []map[string]string{
+					{
+						"text": fmt.Sprintf(analysisPrompt, fullText),
+					},
+				},
+			},
+		},
+		// Optional: Add generationConfig if needed (e.g., temperature for analysis)
+		// "generationConfig": map[string]any{
+		// 	"temperature": 0.3, // Lower temperature for more factual analysis
+		// },
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Speaker analysis: Failed to marshal payload: %v", err)
+		return "", fmt.Errorf("failed to create analysis request body: %w", err)
+	}
+
+	// Use the same Gemini endpoint
+	// Consider if a different model might be better for analysis, but flash should be okay.
+	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-03-25:generateContent?key=" + apiKey
+	log.Printf("Preparing Speaker Analysis API request to Gemini API")
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Speaker analysis: Failed to create API request: %v", err)
+		return "", fmt.Errorf("failed to create analysis request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// Use a longer timeout for potentially large analysis tasks? Or keep standard?
+	client := &http.Client{Timeout: 90 * time.Second} // Increased timeout for analysis
+	log.Printf("Sending speaker analysis request to Gemini API")
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Speaker analysis API request failed: %v", err)
+		return "", fmt.Errorf("analysis API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("Speaker analysis API request returned non-OK status: %s. Body: %s", resp.Status, string(respBodyBytes))
+		return "", fmt.Errorf("analysis API request failed: %s", resp.Status)
+	}
+	log.Printf("Received speaker analysis response from Gemini API with status %s", resp.Status)
+
+	var response GeminiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		log.Printf("Speaker analysis: Failed to decode API response: %v", err)
+		return "", fmt.Errorf("failed to decode analysis response: %w", err)
+	}
+
+	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
+		log.Printf("Speaker analysis API response contained no content")
+		return "", fmt.Errorf("no content in analysis response")
+	}
+
+	analysisResult := response.Candidates[0].Content.Parts[0].Text
+	log.Printf("Successfully completed speaker analysis in %v. Result:\n%s", time.Since(startTime), analysisResult)
+	return analysisResult, nil
 }
 
-func ProcessTranscript(ctx context.Context, text, apiKey string, targetWordCount int) (string, error) {
-	return processTextWithMode(ctx, text, apiKey, targetWordCount, "transcript")
-}
+// --- END NEW FUNCTION ---
 
-func processTextWithMode(ctx context.Context, text, apiKey string, targetWordCount int, mode string) (string, error) {
+// Modify ProcessText to handle both modes, accepting speakerAnalysis for transcript mode
+// No need for separate ProcessTranscript function here anymore.
+func ProcessTextWithMode(ctx context.Context, text, apiKey string, targetWordCount int, mode string, speakerAnalysis string) (string, error) {
 	startTime := time.Now()
 	inputWordCount := len(strings.Fields(text))
 	log.Printf("Processing text chunk of %d words (target: %d words) in %s mode",
@@ -321,29 +506,57 @@ func processTextWithMode(ctx context.Context, text, apiKey string, targetWordCou
 
 	var prompt string
 	if mode == "transcript" {
-		prompt = `You are processing a chunk of subtitles from a YouTube podcast. Format this text as a clean, readable transcript with the following rules:
+		// --- DYNAMIC TRANSCRIPT PROMPT ---
+		if speakerAnalysis == "" {
+			log.Printf("Warning: Processing transcript chunk without speaker analysis context.")
+			// Fallback to a generic prompt if analysis is missing
+			speakerAnalysis = "- Total Speakers: Unknown\n- Host: Host\n- Guest 1: Guest"
+		}
 
-    Clearly identify speakers as either "Guest:" or "Host:" based on context clues and speech patterns.
+		prompt = fmt.Sprintf(`You are processing a chunk of subtitles from a YouTube podcast. Use the following speaker analysis to format the text as a clean, readable transcript:
 
-    Use extremely simple English suitable for a 10-year-old child, with basic vocabulary only.
-    keep the words almost same as in origional subtitles , improve grammer , spellings and sentence structure.
-    Do not use advanced vocabulary, idioms, or complicated expressions.
+--- Speaker Analysis START ---
+%s
+--- Speaker Analysis END ---
 
-Format the output exactly like this:
+Apply these rules to the CURRENT CHUNK below:
+1. Identify speakers within this chunk based on the Speaker Analysis provided above.
+2. Use the speaker identifiers (e.g., "Host, John Doe:", "Guest 1, Jane Smith:", "Host:", "Guest 1:") exactly as listed in the analysis.
+3. Use extremely simple English suitable for a 10-year-old child, with basic vocabulary only.
+4. Keep the spoken words almost identical to the original subtitles, but improve grammar, spelling, and sentence structure slightly for readability.
+5. Do not use advanced vocabulary, idioms, or complicated expressions.
+6. Format the output strictly line-by-line like this, starting each line with the correct speaker identifier from the analysis:
+[Speaker Identifier]: [Exact simplified speech for that line/turn]
+[Another Speaker Identifier]: [Exact simplified speech for that line/turn]
 
-Guest: [exact simplified speech]
-Host: [exact simplified speech]
+Important Constraints:
+- Return ONLY the formatted transcript lines for THIS CHUNK.
+- Do NOT add any introductory text, concluding remarks, summaries, explanations, or comments.
+- Do NOT repeat the Speaker Analysis in your response.
+- Ensure every line of dialogue starts with a speaker identifier from the analysis.
 
-Important: Return ONLY the formatted transcript without any introductions, explanations, summaries, or additional comments.`
-	} else {
-		prompt = fmt.Sprintf(`Condense this text to exactly exactly %d words while:
+--- CURRENT CHUNK START ---
+%s
+--- CURRENT CHUNK END ---
+
+Formatted Output:`, speakerAnalysis, text)
+		// --- END DYNAMIC PROMPT ---
+
+	} else { // document mode
+		prompt = fmt.Sprintf(`Condense this text to approximately %d words while:
 - Preserving all key plot points and essential information and data.
-- Removing redundant descriptions and unnecessary elaborations
-- Using extremely simple English with basic vocabulary (like for a 10-year-old)
-- must maintain the origional narration style as it is.
+- Removing redundant descriptions and unnecessary elaborations.
+- Using extremely simple English with basic vocabulary (like for a 10-year-old).
+- Maintaining the original narration style as much as possible.
 - If you identify any headings in the text, format them as "# Heading" on their own line in markdown style.
 
-Important: Return ONLY the condensed text without any introductions, explanations, or summaries. Do not include phrases like "Here's the condensed version" or "In summary". Just provide the rewritten text directly.`, targetWordCount)
+Important: Return ONLY the condensed text without any introductions, explanations, or summaries. Do not include phrases like "Here's the condensed version" or "In summary". Just provide the rewritten text directly.
+
+--- TEXT TO CONDENSE START ---
+%s
+--- TEXT TO CONDENSE END ---
+
+Condensed Text:`, targetWordCount, text) // Target word count is less strict now, "approximately"
 	}
 
 	payload := map[string]any{
@@ -351,56 +564,76 @@ Important: Return ONLY the condensed text without any introductions, explanation
 			{
 				"parts": []map[string]string{
 					{
-						"text": fmt.Sprintf("%s\n\n%s", text, prompt),
+						"text": prompt, // Use the generated prompt
 					},
 				},
 			},
 		},
+		// Optional: Add generationConfig if needed
+		"generationConfig": map[string]any{
+			// Adjust temperature based on mode? Lower for transcript, maybe higher for creative condensing?
+			"temperature": 0.4,
+			// Consider maxOutputTokens if chunks can be very large
+		},
 	}
 
 	body, _ := json.Marshal(payload)
-	log.Printf("Preparing API request to Gemini API with model gemini-2.0-flash")
-	req, _ := http.NewRequestWithContext(ctx, "POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-exp-03-25:generateContent?key="+apiKey, bytes.NewReader(body))
+	// Use a model appropriate for the task. 1.5 Flash is good for speed/cost.
+	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + apiKey
+	log.Printf("Preparing API request to Gemini API (%s mode)", mode)
+	req, _ := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	log.Printf("Sending request to Gemini API")
+	// Keep standard timeout for chunk processing
+	client := &http.Client{Timeout: 60 * time.Second} // Slightly longer timeout for safety
+	log.Printf("Sending request to Gemini API (%s mode)", mode)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("API request failed: %v", err)
+		log.Printf("API request failed (%s mode): %v", mode, err)
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("API request returned non-OK status: %s", resp.Status)
-		return "", fmt.Errorf("API request failed: %s", resp.Status)
+		respBodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("API request returned non-OK status (%s mode): %s. Body: %s", mode, resp.Status, string(respBodyBytes))
+		return "", fmt.Errorf("API request failed (%s mode): %s", mode, resp.Status)
 	}
-	log.Printf("Received response from Gemini API with status %s", resp.Status)
+	log.Printf("Received response from Gemini API with status %s (%s mode)", resp.Status, mode)
 
 	var response GeminiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		log.Printf("Failed to decode API response: %v", err)
+		log.Printf("Failed to decode API response (%s mode): %v", mode, err)
 		return "", err
 	}
 
 	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
-		log.Printf("API response contained no content")
-		return "", fmt.Errorf("no content in response")
+		log.Printf("API response contained no content (%s mode)", mode)
+		return "", fmt.Errorf("no content in response (%s mode)", mode)
 	}
 
 	result := response.Candidates[0].Content.Parts[0].Text
 	outputWordCount := len(strings.Fields(result))
 	reductionPercent := 100.0
 	if inputWordCount > 0 {
-		reductionPercent = 100.0 - (float64(outputWordCount)/float64(inputWordCount))*100.0
+		// Reduction calculation might not make sense for transcript formatting, only for condensing.
+		if mode == "document" {
+			reductionPercent = 100.0 - (float64(outputWordCount)/float64(inputWordCount))*100.0
+			log.Printf("Successfully processed text in %v, result length: %d words (reduced from %d words, %.1f%% reduction)",
+				time.Since(startTime), outputWordCount, inputWordCount, reductionPercent)
+		} else {
+			log.Printf("Successfully processed transcript chunk in %v, result length: %d words (input: %d words)",
+				time.Since(startTime), outputWordCount, inputWordCount)
+		}
 	}
 
-	log.Printf("Successfully processed text in %v, result length: %d words (reduced from %d words, %.1f%% reduction)",
-		time.Since(startTime), outputWordCount, inputWordCount, reductionPercent)
 	return result, nil
 }
+
+// Remove the old separate ProcessText and ProcessTranscript functions
+// func ProcessText(...) { ... }
+// func ProcessTranscript(...) { ... }
 
 
 
@@ -660,85 +893,157 @@ File: pkg/transcript/formatter.go
 package transcript
 
 import (
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
 )
 
+// --- REVISED FormatTranscript FUNCTION ---
+// This function processes a single chunk received from the AI,
+// aiming to group consecutive lines from the same speaker.
 func FormatTranscript(text string) string {
-	log.Println("Formatting transcript text")
+	log.Println("Formatting transcript text chunk")
 
-	text = regexp.MustCompile(`\r\n`).ReplaceAllString(text, "\n")
+	// Basic cleanup first
+	text = strings.ReplaceAll(text, "\r\n", "\n") // Normalize line endings
+	text = strings.TrimSpace(text)                // Trim overall chunk
 
-	text = regexp.MustCompile(`\n{2,}`).ReplaceAllString(text, "\n")
-
-	text = regexp.MustCompile(`\s{2,}`).ReplaceAllString(text, " ")
+	if text == "" {
+		return "" // Nothing to format
+	}
 
 	lines := strings.Split(text, "\n")
-	var result []string
-	var currentSpeaker string
-	var currentText string
+	var resultLines []string
+	var currentSpeaker string = ""  // Track the speaker of the current block
+	var currentText strings.Builder // Buffer for the current speaker's text
+
+	speakerPattern := regexp.MustCompile(`^([^:]+):\s*(.*)$`) // Pattern to identify speaker lines
+
+	flushSpeakerText := func() {
+		if currentSpeaker != "" && currentText.Len() > 0 {
+			// Add the accumulated text for the previous speaker
+			resultLines = append(resultLines, fmt.Sprintf("%s: %s", currentSpeaker, strings.TrimSpace(currentText.String())))
+			currentText.Reset() // Clear buffer for the next speaker block
+			// currentSpeaker = "" // Reset speaker *after* flushing
+		}
+	}
 
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		trimmedLine := strings.TrimSpace(line)
+
+		// Ignore empty lines within the chunk for grouping purposes
+		// Blank lines for final output spacing are handled in CombineTranscriptChunks
+		if trimmedLine == "" {
 			continue
 		}
 
-		speakerMatch := regexp.MustCompile(`^([^:]+):\s*(.*)$`).FindStringSubmatch(line)
-		if len(speakerMatch) < 3 {
-			if currentSpeaker != "" {
-				currentText += " " + line
+		speakerMatch := speakerPattern.FindStringSubmatch(trimmedLine)
+
+		if len(speakerMatch) == 3 { // It's a speaker line (e.g., "Host, Name: Speech")
+			speaker := strings.TrimSpace(speakerMatch[1])
+			speech := speakerMatch[2] // Keep potential leading/trailing space in speech for now
+
+			if speaker == currentSpeaker {
+				// Same speaker continues, append speech
+				if currentText.Len() > 0 {
+					currentText.WriteString(" ") // Add space between appended lines
+				}
+				currentText.WriteString(speech)
 			} else {
-				result = append(result, line)
+				// New speaker starts
+				flushSpeakerText()              // Write out the previous speaker's complete text block
+				currentSpeaker = speaker        // Set the new current speaker
+				currentText.WriteString(speech) // Start the new speaker's text buffer
 			}
-			continue
-		}
-
-		speaker := strings.TrimSpace(speakerMatch[1])
-		content := strings.TrimSpace(speakerMatch[2])
-
-		if speaker == currentSpeaker {
-			currentText += " " + content
 		} else {
+			// Not a speaker line (e.g., speech continued on a new line without a tag)
 			if currentSpeaker != "" {
-				result = append(result, currentSpeaker+": "+currentText)
+				// Append this line to the current speaker's text buffer
+				if currentText.Len() > 0 {
+					currentText.WriteString(" ") // Add space
+				}
+				currentText.WriteString(trimmedLine) // Append the whole line
+			} else {
+				// Text before the first speaker tag - less likely with current prompt but handle defensively
+				// Or orphaned text. Let's append it as its own line for now.
+				log.Printf("Warning: Encountered non-speaker line before first speaker or orphaned: '%s'", trimmedLine)
+				resultLines = append(resultLines, trimmedLine)
 			}
-			currentSpeaker = speaker
-			currentText = content
 		}
 	}
 
-	if currentSpeaker != "" {
-		result = append(result, currentSpeaker+": "+currentText)
-	}
+	// Flush any remaining text for the last speaker after the loop finishes
+	flushSpeakerText()
 
-	text = strings.Join(result, "\n")
+	// Join the grouped lines for this chunk
+	processedChunk := strings.Join(resultLines, "\n") // Use single newline between speaker blocks within chunk
 
-	text = strings.TrimPrefix(text, "\n")
-
-	log.Println("Transcript formatting completed")
-	return text
+	log.Printf("Transcript chunk formatting completed. Output lines: %d", len(resultLines))
+	return processedChunk
 }
 
+// --- CombineTranscriptChunks function (Mostly the same as the previous corrected version) ---
+// It now receives chunks where same-speaker lines should already be grouped.
 func CombineTranscriptChunks(chunks []string) string {
-	log.Printf("Combining %d transcript chunks", len(chunks))
+	log.Printf("Combining and applying final formatting to %d transcript chunks", len(chunks))
 
 	var processedChunks []string
-	for i, chunk := range chunks {
-		formatted := FormatTranscript(chunk)
-		processedChunks = append(processedChunks, formatted)
-		log.Printf("Processed chunk %d/%d", i+1, len(chunks))
+	for _, chunk := range chunks {
+		// FormatTranscript above should handle grouping within the chunk
+		formattedChunk := FormatTranscript(chunk)
+		if formattedChunk != "" {
+			processedChunks = append(processedChunks, formattedChunk)
+		}
 	}
 
+	// Join the processed chunks with double newlines (to create one blank line between chunks/turns)
 	combined := strings.Join(processedChunks, "\n\n")
 
+	// --- Start Final Formatting (Name extraction and Bolding) ---
+
 	combined = regexp.MustCompile(`\n{3,}`).ReplaceAllString(combined, "\n\n")
+	combined = strings.TrimSpace(combined)
 
-	log.Printf("Successfully combined transcript chunks into %d words",
-		len(strings.Fields(combined)))
+	var finalLines []string
+	speakerLineRegex := regexp.MustCompile(`^([^:]+):\s*(.*)$`)
+	lines := strings.Split(combined, "\n")
 
-	return combined
+	for _, line := range lines {
+		if line == "" { // Preserve intentional blank lines
+			finalLines = append(finalLines, "")
+			continue
+		}
+
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" { // Skip lines that were only whitespace
+			continue
+		}
+
+		if matches := speakerLineRegex.FindStringSubmatch(trimmedLine); len(matches) == 3 {
+			speakerPart := strings.TrimSpace(matches[1])
+			speechPart := matches[2]
+			extractedName := speakerPart
+
+			if commaIndex := strings.Index(speakerPart, ", "); commaIndex != -1 {
+				extractedName = strings.TrimSpace(speakerPart[commaIndex+2:])
+			}
+
+			formattedLine := fmt.Sprintf("**%s**: %s", extractedName, speechPart)
+			finalLines = append(finalLines, formattedLine)
+		} else {
+			// Handle lines that are not blank and not speaker lines (should be less common now)
+			log.Printf("Warning: Skipping non-speaker line during final formatting: '%s'", trimmedLine)
+			// Optionally keep them: finalLines = append(finalLines, trimmedLine)
+		}
+	}
+
+	finalOutput := strings.Join(finalLines, "\n")
+	finalOutput = regexp.MustCompile(`\n{3,}`).ReplaceAllString(finalOutput, "\n\n") // Final cleanup
+	finalOutput = strings.TrimSpace(finalOutput)
+
+	log.Printf("Successfully combined and formatted transcript. Final word count: %d", len(strings.Fields(finalOutput)))
+	return finalOutput
 }
 
 
@@ -938,6 +1243,7 @@ package workers
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -946,10 +1252,11 @@ import (
 	"github.com/arnnvv/cutcrap/pkg/api"
 	"github.com/arnnvv/cutcrap/pkg/chunker"
 	"github.com/arnnvv/cutcrap/pkg/config"
-	"github.com/arnnvv/cutcrap/pkg/transcript"
+	"github.com/arnnvv/cutcrap/pkg/transcript" // Keep for CombineTranscriptChunks
 )
 
-func ProcessChunks(ctx context.Context, chunks []string, cfg *config.Config, ratio float64, mode string) []string {
+// Modify ProcessChunks to accept speakerAnalysis
+func ProcessChunks(ctx context.Context, chunks []string, cfg *config.Config, ratio float64, mode string, speakerAnalysis string) []string {
 	startTime := time.Now()
 
 	totalInputWords := 0
@@ -959,130 +1266,193 @@ func ProcessChunks(ctx context.Context, chunks []string, cfg *config.Config, rat
 
 	log.Printf("Starting to process %d chunks with max concurrency %d (total input: %d words) in %s mode",
 		len(chunks), cfg.MaxConcurrent, totalInputWords, mode)
+	if mode == "transcript" {
+		log.Printf("Using Speaker Analysis:\n%s", speakerAnalysis)
+	}
 
 	var (
 		wg         sync.WaitGroup
-		results    = make([]string, len(chunks))
+		results    = make([]string, len(chunks)) // Pre-allocate results slice
 		semaphore  = make(chan struct{}, cfg.MaxConcurrent)
-		resultChan = make(chan struct {
+		resultChan = make(chan struct { // Channel to receive results with index
 			index   int
 			content string
+			err     error // Include error in channel communication
 		})
 	)
 
+	// Launch workers in a separate goroutine
 	go func() {
-		log.Printf("Worker goroutine started, will process %d chunks", len(chunks))
+		defer close(resultChan) // Ensure channel is closed when all workers are done
+		log.Printf("Worker dispatcher goroutine started, will process %d chunks", len(chunks))
 		for i, chunk := range chunks {
+			if ctx.Err() != nil { // Check for context cancellation before dispatching
+				log.Printf("Context cancelled before dispatching chunk %d. Aborting further dispatch.", i)
+				break // Stop dispatching new workers
+			}
 			wg.Add(1)
-			semaphore <- struct{}{}
-			chunkWords := len(strings.Fields(chunk))
-			log.Printf("Dispatching worker for chunk %d/%d (size: %d words)", i+1, len(chunks), chunkWords)
+			semaphore <- struct{}{} // Acquire semaphore slot
 
-			go func(index int, text string) {
+			go func(index int, text string, analysis string) { // Pass analysis to worker
 				chunkStartTime := time.Now()
+				var processedContent string
+				var processErr error
+				logPrefix := fmt.Sprintf("Worker chunk %d", index)
+
 				defer func() {
-					<-semaphore
-					wg.Done()
-					log.Printf("Worker for chunk %d completed in %v", index, time.Since(chunkStartTime))
-				}()
-
-				inputWords := len(strings.Fields(text))
-				log.Printf("Processing chunk %d (%d words) in %s mode", index, inputWords, mode)
-
-				targetWordCount := int(float64(cfg.ChunkSize) * ratio)
-				if targetWordCount <= 0 {
-					targetWordCount = 1
-				}
-
-				var content string
-				var err error
-
-				if mode == "transcript" {
-					content, err = api.ProcessTranscript(ctx, text, cfg.OpenRouterKey, targetWordCount)
-				} else {
-					content, err = api.ProcessText(ctx, text, cfg.OpenRouterKey, targetWordCount)
-				}
-
-				if err != nil {
-					log.Printf("Error processing chunk %d: %v", index, err)
-				} else {
-					outputWords := len(strings.Fields(content))
-					log.Printf("Successfully processed chunk %d, result: %d words", index, outputWords)
-					resultChan <- struct {
+					log.Printf("%s completed in %v", logPrefix, time.Since(chunkStartTime))
+					resultChan <- struct { // Send result (content or error) back
 						index   int
 						content string
-					}{index, content}
+						err     error
+					}{index, processedContent, processErr}
+					<-semaphore // Release semaphore slot
+					wg.Done()
+				}()
+
+				// Check context within the worker too
+				if ctx.Err() != nil {
+					log.Printf("%s: Context cancelled before processing started.", logPrefix)
+					processErr = ctx.Err()
+					return
 				}
-			}(i, chunk)
+
+				inputWords := len(strings.Fields(text))
+				log.Printf("%s: Processing (%d words) in %s mode", logPrefix, inputWords, mode)
+
+				// Calculate target word count based on ratio (less relevant for transcript formatting)
+				// For transcript mode, ratio might determine desired density or summarization level *if* that was the goal.
+				// For simple formatting, targetWordCount is less critical, but the API needs it.
+				// Let's base it on the *original* chunk size for consistency.
+				targetWordCount := int(float64(cfg.ChunkSize) * ratio) // Or maybe just a fixed reasonable number for transcripts?
+				if targetWordCount <= 0 {
+					targetWordCount = 1 // Ensure positive
+				}
+				// Log the target count being used
+				log.Printf("%s: Using target word count for API: %d (based on ratio %.2f)", logPrefix, targetWordCount, ratio)
+
+				// Use the consolidated API function
+				processedContent, processErr = api.ProcessTextWithMode(ctx, text, cfg.OpenRouterKey, targetWordCount, mode, analysis)
+
+				if processErr != nil {
+					log.Printf("%s: Error during API processing: %v", logPrefix, processErr)
+					// processedContent remains empty
+				} else if ctx.Err() != nil {
+					// Check context *after* API call returns, in case it finished just as context was cancelled
+					log.Printf("%s: Context cancelled during or immediately after processing.", logPrefix)
+					processErr = ctx.Err()
+					processedContent = "" // Discard potentially partial result
+				} else {
+					outputWords := len(strings.Fields(processedContent))
+					log.Printf("%s: Successfully processed, result: %d words", logPrefix, outputWords)
+				}
+
+			}(i, chunk, speakerAnalysis) // Pass index, chunk text, and speaker analysis
 		}
-		log.Println("All workers dispatched, waiting for completion")
+		log.Println("Worker dispatcher: All workers dispatched, waiting for completion...")
 		wg.Wait()
-		log.Println("All workers completed, closing result channel")
-		close(resultChan)
-	}()
+		log.Println("Worker dispatcher: All workers completed.")
+	}() // End of worker dispatcher goroutine
 
-	log.Println("Collecting results from workers")
-	resultCount := 0
+	log.Println("Main thread: Collecting results from workers...")
+	processedCount := 0
+	errorCount := 0
 	for res := range resultChan {
-		resultCount++
-		resultWords := len(strings.Fields(res.content))
-		log.Printf("Received result %d/%d for chunk %d (%d words)", resultCount, len(chunks), res.index, resultWords)
-		results[res.index] = res.content
+		processedCount++
+		if res.err != nil {
+			errorCount++
+			// Keep results[res.index] as empty string (or nil if slice held pointers)
+			log.Printf("Main thread: Received error for chunk %d: %v", res.index, res.err)
+		} else {
+			log.Printf("Main thread: Received result %d/%d for chunk %d (%d words)", processedCount, len(chunks), res.index, len(strings.Fields(res.content)))
+			results[res.index] = res.content // Store successful result
+		}
 	}
+	log.Printf("Main thread: Result collection complete. Processed: %d, Errors: %d", processedCount-errorCount, errorCount)
 
+	// Post-processing (Combine results, calculate stats)
 	validResults := 0
 	totalOutputWords := 0
-	for _, r := range results {
-		if r != "" {
+	var finalResults []string // Use a new slice for valid, ordered results
+
+	for _, r := range results { // Iterate through the pre-allocated slice in order
+		if r != "" { // Check if result is valid (not empty due to error or API issue)
 			validResults++
 			totalOutputWords += len(strings.Fields(r))
+			finalResults = append(finalResults, r) // Add valid result to final list
 		}
 	}
 
-	reductionPercent := 100.0
-	if totalInputWords > 0 {
+	reductionPercent := 0.0 // Initialize
+	if mode == "document" && totalInputWords > 0 {
 		reductionPercent = 100.0 - (float64(totalOutputWords)/float64(totalInputWords))*100.0
+		log.Printf("Processing completed in %v. Input: %d words, Output: %d words (%.1f%% reduction). Valid chunks: %d/%d",
+			time.Since(startTime), totalInputWords, totalOutputWords, reductionPercent, validResults, len(chunks))
+	} else {
+		log.Printf("Transcript formatting completed in %v. Input: %d words, Output: %d words. Valid chunks: %d/%d",
+			time.Since(startTime), totalInputWords, totalOutputWords, validResults, len(chunks))
 	}
 
-	log.Printf("Processing completed in %v, received %d valid results out of %d chunks",
-		time.Since(startTime), validResults, len(chunks))
-	log.Printf("Total input: %d words, total output: %d words (%.1f%% reduction)",
-		totalInputWords, totalOutputWords, reductionPercent)
-
+	// Combine transcript chunks *after* all processing is done
 	if mode == "transcript" && validResults > 0 {
-		log.Printf("Applying transcript formatting to %d chunks", validResults)
-		var validChunks []string
-		for _, r := range results {
-			if r != "" {
-				validChunks = append(validChunks, r)
-			}
-		}
-
-		combinedResult := transcript.CombineTranscriptChunks(validChunks)
-		return []string{combinedResult}
+		log.Printf("Applying final transcript formatting/combining to %d valid chunks", validResults)
+		// Use the 'finalResults' slice which contains only valid, ordered chunks
+		combinedResult := transcript.CombineTranscriptChunks(finalResults)
+		return []string{combinedResult} // Return the single combined string in a slice
 	}
 
-	return results
+	// For document mode, return the slice of processed chunks (already filtered in finalResults)
+	return finalResults
 }
 
+// Modify ProcessTranscript to perform analysis first
 func ProcessTranscript(ctx context.Context, text string, cfg *config.Config, ratio float64) string {
 	log.Printf("Processing transcript of %d words with ratio %.2f", len(strings.Fields(text)), ratio)
 
+	// --- Step 1: Analyze Speakers ---
+	speakerAnalysis, err := api.AnalyzeSpeakers(ctx, text, cfg.OpenRouterKey)
+	if err != nil {
+		// Decide how to handle analysis failure: proceed without context or fail?
+		// Let's log the error and proceed with a warning (fallback handled in ProcessTextWithMode)
+		log.Printf("WARNING: Speaker analysis failed: %v. Proceeding without speaker context.", err)
+		speakerAnalysis = "" // Ensure it's empty if failed
+	}
+	if ctx.Err() != nil {
+		log.Printf("Context cancelled during speaker analysis.")
+		return "" // Or return context error?
+	}
+	// -----------------------------
+
+	// --- Step 2: Chunk the Text ---
+	// Chunking by space might be better for transcripts to avoid cutting mid-sentence/turn
 	chunks, err := chunker.ChunkTextBySpace(text, cfg.ChunkSize, cfg.ChunkOverlap)
 	if err != nil {
 		log.Printf("Error chunking transcript text: %v", err)
 		return ""
 	}
-
+	if len(chunks) == 0 {
+		log.Printf("Transcript text resulted in zero chunks.")
+		return ""
+	}
 	log.Printf("Chunked transcript into %d parts", len(chunks))
+	// -----------------------------
 
-	results := ProcessChunks(ctx, chunks, cfg, ratio, "transcript")
+	// --- Step 3: Process Chunks with Analysis Context ---
+	// Pass speakerAnalysis to ProcessChunks
+	results := ProcessChunks(ctx, chunks, cfg, ratio, "transcript", speakerAnalysis)
+	// -----------------------------------------------------
 
-	if len(results) == 0 {
-		log.Printf("No results returned from transcript processing")
+	if ctx.Err() != nil {
+		log.Printf("Context cancelled during chunk processing.")
 		return ""
 	}
 
+	if len(results) == 0 {
+		log.Printf("No valid results returned from transcript processing")
+		return ""
+	}
+
+	// ProcessChunks now returns a slice containing the single combined result for transcripts
 	return results[0]
 }
 
