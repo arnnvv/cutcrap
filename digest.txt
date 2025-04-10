@@ -1,0 +1,1244 @@
+Directory structure:
+└── cutcrap/
+    ├── Dockerfile
+    ├── go.mod
+    ├── main.go
+    ├── .dockerignore
+    ├── .env.example
+    ├── pkg/
+    │   ├── api/
+    │   │   └── openrouter.go
+    │   ├── chunker/
+    │   │   └── chunker.go
+    │   ├── config/
+    │   │   └── config.go
+    │   ├── transcript/
+    │   │   ├── formatter.go
+    │   │   └── speakers.go
+    │   ├── utils/
+    │   │   ├── errors.go
+    │   │   └── files.go
+    │   └── workers/
+    │       └── pool.go
+    └── .github/
+        └── workflows/
+            └── deploy.yml
+
+================================================
+File: Dockerfile
+================================================
+FROM golang:1.24.1-alpine3.21 as builder
+
+WORKDIR /app
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux \
+    go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o api
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder --chmod=0755 /app/api /api
+USER nonroot:nonroot
+ENTRYPOINT ["/api"]
+
+
+
+================================================
+File: go.mod
+================================================
+module github.com/arnnvv/cutcrap
+
+go 1.24.1
+
+
+
+================================================
+File: main.go
+================================================
+package main
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/arnnvv/cutcrap/pkg/chunker"
+	"github.com/arnnvv/cutcrap/pkg/config"
+	"github.com/arnnvv/cutcrap/pkg/workers"
+)
+
+func enableCors(w *http.ResponseWriter) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func main() {
+	log.Println("Starting PDF processor service")
+	cfg := config.Load()
+	log.Printf("Configuration loaded: Port=%s, MaxConcurrent=%d, ChunkSize=%d, PdfApi=%s", cfg.Port, cfg.MaxConcurrent, cfg.ChunkSize, cfg.Pdf_api)
+
+	http.HandleFunc("/process", func(w http.ResponseWriter, r *http.Request) {
+		enableCors(&w)
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		uploadHandler(cfg)(w, r)
+	})
+
+	log.Printf("Server starting on :%s", cfg.Port)
+	log.Fatal(http.ListenAndServe(":"+cfg.Port, nil))
+}
+
+func uploadHandler(cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
+		log.Printf("\n\n=== NEW REQUEST ===")
+		log.Printf("From: %s | Method: %s", r.RemoteAddr, r.Method)
+		defer func() {
+			log.Printf("=== REQUEST COMPLETED IN %v ===\n", time.Since(startTime))
+		}()
+
+		if err := r.ParseForm(); err != nil {
+			log.Printf("FORM PARSE ERROR: %v", err)
+			http.Error(w, "Invalid form data", http.StatusBadRequest)
+			return
+		}
+
+		text := r.FormValue("text")
+		ratioStr := r.FormValue("ratio")
+		mode := r.FormValue("mode")
+
+		if text == "" {
+			log.Printf("VALIDATION FAILED: Empty text")
+			http.Error(w, "Text field is missing", http.StatusBadRequest)
+			return
+		}
+
+		ratio, err := strconv.ParseFloat(ratioStr, 64)
+		if err != nil || ratio <= 0 || ratio > 1 {
+			log.Printf("VALIDATION FAILED: Invalid ratio %v", ratioStr)
+			http.Error(w, "Invalid ratio value", http.StatusBadRequest)
+			return
+		}
+
+		if mode == "" {
+			mode = "document"
+		}
+
+		if mode != "document" && mode != "transcript" {
+			http.Error(w, "Invalid mode value", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+
+		inputWordCount := len(strings.Fields(text))
+		log.Printf("PROCESSING START | Mode: %s | Words: %d", mode, inputWordCount)
+
+		var results []string
+		if mode == "transcript" {
+			result := workers.ProcessTranscript(ctx, text, cfg, ratio)
+			if result == "" {
+				http.Error(w, "Transcript processing failed", http.StatusInternalServerError)
+				return
+			}
+			results = []string{result}
+		} else {
+			chunks, err := chunker.ChunkText(text, cfg.ChunkSize)
+			if err != nil {
+				http.Error(w, "Text chunking failed", http.StatusInternalServerError)
+				return
+			}
+			results = workers.ProcessChunks(ctx, chunks, cfg, ratio, "document")
+		}
+
+		combinedResult := combineResults(results)
+		outputWordCount := len(strings.Fields(combinedResult))
+		log.Printf("RESPONSE READY | Input: %d words | Output: %d words | Reduction: %.1f%%",
+			inputWordCount, outputWordCount,
+			100.0-(float64(outputWordCount)/float64(inputWordCount))*100.0)
+
+		if strings.Contains(combinedResult, "# ") {
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Header().Set("Content-Disposition", "attachment; filename=processed.pdf")
+
+			var body bytes.Buffer
+			mpWriter := multipart.NewWriter(&body)
+			fileWriter, err := mpWriter.CreateFormFile("file", "processed.md")
+			if err != nil {
+				log.Printf("PDF API FORM CREATION FAILED: %v", err)
+				http.Error(w, "PDF generation failed 1", http.StatusInternalServerError)
+				return
+			}
+
+			if _, err := fileWriter.Write([]byte(combinedResult)); err != nil {
+				log.Printf("PDF API WRITE FAILED: %v", err)
+				http.Error(w, "PDF generation failed 2", http.StatusInternalServerError)
+				return
+			}
+			mpWriter.Close()
+
+			req, err := http.NewRequestWithContext(ctx, "POST", cfg.Pdf_api, &body)
+			if err != nil {
+				log.Printf("PDF API REQUEST CREATION FAILED: %v", err)
+				http.Error(w, "PDF generation failed 3", http.StatusInternalServerError)
+				return
+			}
+			req.Header.Set("Content-Type", mpWriter.FormDataContentType())
+
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("PDF API REQUEST FAILED: %v", err)
+				http.Error(w, "PDF generation failed 4", http.StatusInternalServerError)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("PDF API RETURNED STATUS: %d", resp.StatusCode)
+				http.Error(w, "PDF generation failed 5", http.StatusInternalServerError)
+				return
+			}
+
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				log.Printf("PDF STREAM FAILED: %v", err)
+				http.Error(w, "PDF generation failed 6", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, combinedResult)
+		}
+	}
+}
+
+func combineResults(results []string) string {
+	var final strings.Builder
+	for i, res := range results {
+		final.WriteString(res)
+		if i < len(results)-1 {
+			final.WriteString("\n\n")
+		}
+	}
+	return final.String()
+}
+
+
+
+================================================
+File: .dockerignore
+================================================
+.env
+.git/
+.github/
+.gitignore
+.env.example
+
+
+
+================================================
+File: .env.example
+================================================
+PORT=
+OPENROUTER_API_KEY=
+MAX_CONCURRENT=
+REQUEST_TIMEOUT=
+CHUNK_SIZE=
+TARGET_WORD_COUNT=
+CHUNK_OVERLAP=
+PDF_API=
+
+
+
+================================================
+File: pkg/api/openrouter.go
+================================================
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type GeminiResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+			Role string `json:"role"`
+		} `json:"content"`
+		FinishReason string  `json:"finishReason"`
+		AvgLogprobs  float64 `json:"avgLogprobs"`
+	} `json:"candidates"`
+	UsageMetadata struct {
+		PromptTokenCount     int `json:"promptTokenCount"`
+		CandidatesTokenCount int `json:"candidatesTokenCount"`
+		TotalTokenCount      int `json:"totalTokenCount"`
+		PromptTokensDetails  []struct {
+			Modality   string `json:"modality"`
+			TokenCount int    `json:"tokenCount"`
+		} `json:"promptTokensDetails"`
+		CandidatesTokensDetails []struct {
+			Modality   string `json:"modality"`
+			TokenCount int    `json:"tokenCount"`
+		} `json:"candidatesTokensDetails"`
+	} `json:"usageMetadata"`
+	ModelVersion string `json:"modelVersion"`
+}
+
+func ProcessText(ctx context.Context, text, apiKey string, targetWordCount int) (string, error) {
+	return processTextWithMode(ctx, text, apiKey, targetWordCount, "document")
+}
+
+func ProcessTranscript(ctx context.Context, text, apiKey string, targetWordCount int) (string, error) {
+	return processTextWithMode(ctx, text, apiKey, targetWordCount, "transcript")
+}
+
+func processTextWithMode(ctx context.Context, text, apiKey string, targetWordCount int, mode string) (string, error) {
+	startTime := time.Now()
+	inputWordCount := len(strings.Fields(text))
+	log.Printf("Processing text chunk of %d words (target: %d words) in %s mode",
+		inputWordCount, targetWordCount, mode)
+
+	var prompt string
+	if mode == "transcript" {
+		prompt = `You are processing a chunk of subtitles from a YouTube podcast. Format this text as a clean, readable transcript with the following rules:
+
+    Clearly identify speakers as either "Guest:" or "Host:" based on context clues and speech patterns.
+
+    Use extremely simple English suitable for a 10-year-old child, with basic vocabulary only.
+    keep the words almost same as in origional subtitles , improve grammer , spellings and sentence structure.
+    Do not use advanced vocabulary, idioms, or complicated expressions.
+
+Format the output exactly like this:
+
+Guest: [exact simplified speech]
+Host: [exact simplified speech]
+
+Important: Return ONLY the formatted transcript without any introductions, explanations, summaries, or additional comments.`
+	} else {
+		prompt = fmt.Sprintf(`Condense this text to exactly exactly %d words while:
+- Preserving all key plot points and essential information and data.
+- Removing redundant descriptions and unnecessary elaborations
+- Using extremely simple English with basic vocabulary (like for a 10-year-old)
+- must maintain the origional narration style as it is.
+- If you identify any headings in the text, format them as "# Heading" on their own line in markdown style.
+
+Important: Return ONLY the condensed text without any introductions, explanations, or summaries. Do not include phrases like "Here's the condensed version" or "In summary". Just provide the rewritten text directly.`, targetWordCount)
+	}
+
+	payload := map[string]any{
+		"contents": []map[string]any{
+			{
+				"parts": []map[string]string{
+					{
+						"text": fmt.Sprintf("%s\n\n%s", text, prompt),
+					},
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(payload)
+	log.Printf("Preparing API request to Gemini API with model gemini-2.0-flash")
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-exp-03-25:generateContent?key="+apiKey, bytes.NewReader(body))
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	log.Printf("Sending request to Gemini API")
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("API request failed: %v", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("API request returned non-OK status: %s", resp.Status)
+		return "", fmt.Errorf("API request failed: %s", resp.Status)
+	}
+	log.Printf("Received response from Gemini API with status %s", resp.Status)
+
+	var response GeminiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		log.Printf("Failed to decode API response: %v", err)
+		return "", err
+	}
+
+	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
+		log.Printf("API response contained no content")
+		return "", fmt.Errorf("no content in response")
+	}
+
+	result := response.Candidates[0].Content.Parts[0].Text
+	outputWordCount := len(strings.Fields(result))
+	reductionPercent := 100.0
+	if inputWordCount > 0 {
+		reductionPercent = 100.0 - (float64(outputWordCount)/float64(inputWordCount))*100.0
+	}
+
+	log.Printf("Successfully processed text in %v, result length: %d words (reduced from %d words, %.1f%% reduction)",
+		time.Since(startTime), outputWordCount, inputWordCount, reductionPercent)
+	return result, nil
+}
+
+
+
+================================================
+File: pkg/chunker/chunker.go
+================================================
+package chunker
+
+import (
+	"log"
+	"strings"
+	"unicode"
+)
+
+func ChunkText(content string, chunkSize int) ([]string, error) {
+	log.Printf("Starting text chunking with chunk size %d words", chunkSize)
+
+	content = strings.ReplaceAll(content, "\r\n", " ")
+	content = strings.ReplaceAll(content, "\n", " ")
+
+	sentences := splitIntoSentences(content)
+	log.Printf("Split content into %d sentences", len(sentences))
+
+	return createChunksFromSentences(sentences, chunkSize), nil
+}
+
+func ChunkTextBySpace(content string, chunkSize int, overlap int) ([]string, error) {
+	log.Printf("Starting space-based text chunking with chunk size %d words and %d words overlap",
+		chunkSize, overlap)
+
+	content = strings.ReplaceAll(content, "\r\n", " ")
+	content = strings.ReplaceAll(content, "\n", " ")
+
+	content = strings.Join(strings.Fields(content), " ")
+
+	words := strings.Fields(content)
+	log.Printf("Text contains %d words total", len(words))
+
+	var chunks []string
+
+	if len(words) <= chunkSize {
+		log.Printf("Text is smaller than chunk size, returning as single chunk")
+		return []string{content}, nil
+	}
+
+	for i := 0; i < len(words); i += (chunkSize - overlap) {
+		end := i + chunkSize
+		if end > len(words) {
+                        end = len(words)
+                }
+
+		chunk := strings.Join(words[i:end], " ")
+		chunks = append(chunks, chunk)
+
+		if i > 0 && i%1000 == 0 {
+			log.Printf("Created %d chunks so far", len(chunks))
+		}
+
+		if end == len(words) {
+			break
+		}
+	}
+
+	log.Printf("Created %d chunks using space-based chunking", len(chunks))
+	return chunks, nil
+}
+
+func splitIntoSentences(text string) []string {
+	log.Printf("Splitting text into sentences, text length: %d characters", len(text))
+
+	text = replaceAbbreviations(text)
+
+	var sentences []string
+	var currentSentence strings.Builder
+
+	for i := 0; i < len(text); i++ {
+		currentSentence.WriteByte(text[i])
+
+		if (text[i] == '.' || text[i] == '!' || text[i] == '?') &&
+			(i == len(text)-1 || unicode.IsSpace(rune(text[i+1]))) {
+
+			sentence := strings.TrimSpace(currentSentence.String())
+			if len(strings.Fields(sentence)) > 0 {
+				sentences = append(sentences, sentence)
+			}
+			currentSentence.Reset()
+		}
+	}
+
+	if currentSentence.Len() > 0 {
+		sentence := strings.TrimSpace(currentSentence.String())
+		if len(strings.Fields(sentence)) > 0 {
+			sentences = append(sentences, sentence)
+		}
+	}
+
+	log.Printf("Found %d sentences in text", len(sentences))
+	return sentences
+}
+
+func createChunksFromSentences(sentences []string, targetChunkSize int) []string {
+	var chunks []string
+	var currentChunk strings.Builder
+	currentWordCount := 0
+
+	for i, sentence := range sentences {
+		sentenceWords := len(strings.Fields(sentence))
+
+		if currentWordCount > 0 && currentWordCount+sentenceWords > targetChunkSize {
+			chunk := strings.TrimSpace(currentChunk.String())
+			chunks = append(chunks, chunk)
+			log.Printf("Created chunk with %d words", currentWordCount)
+
+			currentChunk.Reset()
+			currentWordCount = 0
+		}
+
+		currentChunk.WriteString(sentence + " ")
+		currentWordCount += sentenceWords
+
+		if i > 0 && i%100 == 0 {
+			log.Printf("Processed %d/%d sentences", i, len(sentences))
+		}
+	}
+
+	if currentChunk.Len() > 0 {
+		chunk := strings.TrimSpace(currentChunk.String())
+		chunks = append(chunks, chunk)
+		log.Printf("Created final chunk with %d words", currentWordCount)
+	}
+
+	log.Printf("Created %d chunks from %d sentences", len(chunks), len(sentences))
+	return chunks
+}
+
+func replaceAbbreviations(text string) string {
+	abbreviations := []string{
+		"Mr.", "Mrs.", "Ms.", "Dr.", "Prof.",
+		"Inc.", "Ltd.", "Co.", "Corp.",
+		"i.e.", "e.g.", "etc.",
+		"vs.", "a.m.", "p.m.",
+		"U.S.", "U.K.", "E.U.",
+	}
+
+	result := text
+	for _, abbr := range abbreviations {
+		placeholder := strings.ReplaceAll(abbr, ".", "·")
+		result = strings.ReplaceAll(result, abbr, placeholder)
+	}
+
+	return result
+}
+
+
+
+================================================
+File: pkg/config/config.go
+================================================
+package config
+
+import (
+	"log"
+	"os"
+	"strconv"
+	"time"
+)
+
+type Config struct {
+	Port           string
+	OpenRouterKey  string
+	MaxConcurrent  int
+	RequestTimeout time.Duration
+	ChunkSize      int
+	ChunkOverlap   int
+	Pdf_api        string
+}
+
+func Load() *Config {
+	log.Println("Loading configuration from environment")
+
+	port := getEnv("PORT", "8080")
+	log.Printf("PORT: %s", port)
+
+	pdf_api := getEnv("PDF_API", "")
+	apiKey := getEnv("OPENROUTER_API_KEY", "")
+	if apiKey == "" {
+		log.Printf("WARNING: OPENROUTER_API_KEY not set")
+	} else {
+		log.Printf("OPENROUTER_API_KEY: [REDACTED]")
+	}
+
+	maxConcurrent := getEnvAsInt("MAX_CONCURRENT", 10)
+	log.Printf("MAX_CONCURRENT: %d", maxConcurrent)
+
+	requestTimeout := getEnvAsDuration("REQUEST_TIMEOUT", 30*time.Second)
+	log.Printf("REQUEST_TIMEOUT: %v", requestTimeout)
+
+	chunkSize := getEnvAsInt("CHUNK_SIZE", 900)
+	log.Printf("CHUNK_SIZE: %d", chunkSize)
+
+	chunkOverlap := getEnvAsInt("CHUNK_OVERLAP", 100)
+	log.Printf("CHUNK_OVERLAP: %d", chunkOverlap)
+
+	return &Config{
+		Port:           port,
+		OpenRouterKey:  apiKey,
+		MaxConcurrent:  maxConcurrent,
+		RequestTimeout: requestTimeout,
+		ChunkSize:      chunkSize,
+		ChunkOverlap:   chunkOverlap,
+		Pdf_api:        pdf_api,
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		log.Printf("Environment variable %s not set, using default: %s", key, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+func getEnvAsInt(key string, defaultValue int) int {
+	valueStr := getEnv(key, "")
+	if valueStr == "" {
+		return defaultValue
+	}
+
+	value, err := strconv.Atoi(valueStr)
+	if err != nil {
+		log.Printf("Failed to parse %s as integer: %v, using default: %d", key, err, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+func getEnvAsDuration(key string, defaultValue time.Duration) time.Duration {
+	valueStr := getEnv(key, "")
+	if valueStr == "" {
+		return defaultValue
+	}
+
+	value, err := time.ParseDuration(valueStr)
+	if err != nil {
+		log.Printf("Failed to parse %s as duration: %v, using default: %v", key, err, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+
+
+================================================
+File: pkg/transcript/formatter.go
+================================================
+package transcript
+
+import (
+	"log"
+	"regexp"
+	"strings"
+)
+
+func FormatTranscript(text string) string {
+	log.Println("Formatting transcript text")
+
+	text = regexp.MustCompile(`\r\n`).ReplaceAllString(text, "\n")
+
+	text = regexp.MustCompile(`\n{2,}`).ReplaceAllString(text, "\n")
+
+	text = regexp.MustCompile(`\s{2,}`).ReplaceAllString(text, " ")
+
+	lines := strings.Split(text, "\n")
+	var result []string
+	var currentSpeaker string
+	var currentText string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		speakerMatch := regexp.MustCompile(`^([^:]+):\s*(.*)$`).FindStringSubmatch(line)
+		if len(speakerMatch) < 3 {
+			if currentSpeaker != "" {
+				currentText += " " + line
+			} else {
+				result = append(result, line)
+			}
+			continue
+		}
+
+		speaker := strings.TrimSpace(speakerMatch[1])
+		content := strings.TrimSpace(speakerMatch[2])
+
+		if speaker == currentSpeaker {
+			currentText += " " + content
+		} else {
+			if currentSpeaker != "" {
+				result = append(result, currentSpeaker+": "+currentText)
+			}
+			currentSpeaker = speaker
+			currentText = content
+		}
+	}
+
+	if currentSpeaker != "" {
+		result = append(result, currentSpeaker+": "+currentText)
+	}
+
+	text = strings.Join(result, "\n")
+
+	text = strings.TrimPrefix(text, "\n")
+
+	log.Println("Transcript formatting completed")
+	return text
+}
+
+func CombineTranscriptChunks(chunks []string) string {
+	log.Printf("Combining %d transcript chunks", len(chunks))
+
+	var processedChunks []string
+	for i, chunk := range chunks {
+		formatted := FormatTranscript(chunk)
+		processedChunks = append(processedChunks, formatted)
+		log.Printf("Processed chunk %d/%d", i+1, len(chunks))
+	}
+
+	combined := strings.Join(processedChunks, "\n\n")
+
+	combined = regexp.MustCompile(`\n{3,}`).ReplaceAllString(combined, "\n\n")
+
+	log.Printf("Successfully combined transcript chunks into %d words",
+		len(strings.Fields(combined)))
+
+	return combined
+}
+
+
+
+================================================
+File: pkg/transcript/speakers.go
+================================================
+package transcript
+
+import (
+	"log"
+	"regexp"
+	"strings"
+)
+
+type SpeakerInfo struct {
+	OriginalLabel string
+	StandardLabel string
+	Occurrences   int
+}
+
+func DetectSpeakers(text string) map[string]string {
+	log.Println("Detecting speakers in transcript text")
+
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^([A-Za-z][A-Za-z\s\.]{0,20}):\s`),
+		regexp.MustCompile(`\[([A-Za-z][A-Za-z\s\.]{0,20})\]:`),
+		regexp.MustCompile(`(?i)(speaker|person)\s*([a-z0-9])(\s|:)`),
+		regexp.MustCompile(`(?i)(host|guest|interviewer|interviewee)(\s|:)`),
+	}
+
+	speakerMap := make(map[string]SpeakerInfo)
+
+	for _, pattern := range patterns {
+		matches := pattern.FindAllStringSubmatch(text, -1)
+		for _, match := range matches {
+			if len(match) > 1 {
+				speaker := strings.TrimSpace(match[1])
+				if speaker != "" {
+					info, exists := speakerMap[speaker]
+					if exists {
+						info.Occurrences++
+						speakerMap[speaker] = info
+					} else {
+						speakerMap[speaker] = SpeakerInfo{
+							OriginalLabel: speaker,
+							StandardLabel: "",
+							Occurrences:   1,
+						}
+					}
+				}
+			}
+		}
+	}
+
+	result := make(map[string]string)
+
+	for name := range speakerMap {
+		if strings.EqualFold(name, "Guest") || strings.EqualFold(name, "Host") {
+			result[name+":"] = name + ":"
+		}
+	}
+
+	log.Printf("Preserved %d speaker labels in transcript", len(result))
+	return result
+}
+
+func StandardizeSpeakers(text string, speakerMap map[string]string) string {
+	if len(speakerMap) == 0 {
+		return text
+	}
+
+	log.Println("Standardizing speaker labels in transcript")
+
+	result := text
+	for original, standard := range speakerMap {
+		pattern := regexp.MustCompile(`(?m)(^|\n)` + regexp.QuoteMeta(original) + `\s*`)
+		result = pattern.ReplaceAllString(result, "${1}"+standard+" ")
+	}
+
+	return result
+}
+
+
+
+================================================
+File: pkg/utils/errors.go
+================================================
+package utils
+
+import "fmt"
+
+type ProcessingError struct {
+	Step    string
+	Message string
+	Err     error
+}
+
+func (e *ProcessingError) Error() string {
+	return fmt.Sprintf("%s error: %s (%v)", e.Step, e.Message, e.Err)
+}
+
+func WrapError(step, message string, err error) error {
+	return &ProcessingError{
+		Step:    step,
+		Message: message,
+		Err:     err,
+	}
+}
+
+
+
+================================================
+File: pkg/utils/files.go
+================================================
+package utils
+
+import (
+	"fmt"
+	"io"
+	"mime/multipart"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+func ValidatePDF(file multipart.File) error {
+	buf := make([]byte, 4)
+	_, err := file.Read(buf)
+	if err != nil {
+		return err
+	}
+
+	_, err = file.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	if string(buf) != "%PDF" {
+		return fmt.Errorf("not a valid PDF file")
+	}
+
+	return nil
+}
+
+func CreateTempFile(prefix string) (*os.File, string, error) {
+	tmpFile, err := os.CreateTemp("", prefix+"_*.tmp")
+	if err != nil {
+		return nil, "", err
+	}
+	return tmpFile, tmpFile.Name(), nil
+}
+
+func SaveUploadedFile(file multipart.File, header *multipart.FileHeader) (string, error) {
+	tmpFile, tmpPath, err := CreateTempFile("upload")
+	if err != nil {
+		return "", err
+	}
+	defer tmpFile.Close()
+
+	_, err = io.Copy(tmpFile, file)
+	if err != nil {
+		os.Remove(tmpPath)
+		return "", err
+	}
+
+	return tmpPath, nil
+}
+
+func CleanupTempFiles(paths ...string) {
+	for _, path := range paths {
+		os.Remove(path)
+	}
+}
+
+func GetSafeFilename(original string) string {
+	base := filepath.Base(original)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, name)
+
+	return safe + "-processed.txt"
+}
+
+
+
+================================================
+File: pkg/workers/pool.go
+================================================
+package workers
+
+import (
+	"context"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/arnnvv/cutcrap/pkg/api"
+	"github.com/arnnvv/cutcrap/pkg/chunker"
+	"github.com/arnnvv/cutcrap/pkg/config"
+	"github.com/arnnvv/cutcrap/pkg/transcript"
+)
+
+func ProcessChunks(ctx context.Context, chunks []string, cfg *config.Config, ratio float64, mode string) []string {
+	startTime := time.Now()
+
+	totalInputWords := 0
+	for _, chunk := range chunks {
+		totalInputWords += len(strings.Fields(chunk))
+	}
+
+	log.Printf("Starting to process %d chunks with max concurrency %d (total input: %d words) in %s mode",
+		len(chunks), cfg.MaxConcurrent, totalInputWords, mode)
+
+	var (
+		wg         sync.WaitGroup
+		results    = make([]string, len(chunks))
+		semaphore  = make(chan struct{}, cfg.MaxConcurrent)
+		resultChan = make(chan struct {
+			index   int
+			content string
+		})
+	)
+
+	go func() {
+		log.Printf("Worker goroutine started, will process %d chunks", len(chunks))
+		for i, chunk := range chunks {
+			wg.Add(1)
+			semaphore <- struct{}{}
+			chunkWords := len(strings.Fields(chunk))
+			log.Printf("Dispatching worker for chunk %d/%d (size: %d words)", i+1, len(chunks), chunkWords)
+
+			go func(index int, text string) {
+				chunkStartTime := time.Now()
+				defer func() {
+					<-semaphore
+					wg.Done()
+					log.Printf("Worker for chunk %d completed in %v", index, time.Since(chunkStartTime))
+				}()
+
+				inputWords := len(strings.Fields(text))
+				log.Printf("Processing chunk %d (%d words) in %s mode", index, inputWords, mode)
+
+				targetWordCount := int(float64(cfg.ChunkSize) * ratio)
+				if targetWordCount <= 0 {
+					targetWordCount = 1
+				}
+
+				var content string
+				var err error
+
+				if mode == "transcript" {
+					content, err = api.ProcessTranscript(ctx, text, cfg.OpenRouterKey, targetWordCount)
+				} else {
+					content, err = api.ProcessText(ctx, text, cfg.OpenRouterKey, targetWordCount)
+				}
+
+				if err != nil {
+					log.Printf("Error processing chunk %d: %v", index, err)
+				} else {
+					outputWords := len(strings.Fields(content))
+					log.Printf("Successfully processed chunk %d, result: %d words", index, outputWords)
+					resultChan <- struct {
+						index   int
+						content string
+					}{index, content}
+				}
+			}(i, chunk)
+		}
+		log.Println("All workers dispatched, waiting for completion")
+		wg.Wait()
+		log.Println("All workers completed, closing result channel")
+		close(resultChan)
+	}()
+
+	log.Println("Collecting results from workers")
+	resultCount := 0
+	for res := range resultChan {
+		resultCount++
+		resultWords := len(strings.Fields(res.content))
+		log.Printf("Received result %d/%d for chunk %d (%d words)", resultCount, len(chunks), res.index, resultWords)
+		results[res.index] = res.content
+	}
+
+	validResults := 0
+	totalOutputWords := 0
+	for _, r := range results {
+		if r != "" {
+			validResults++
+			totalOutputWords += len(strings.Fields(r))
+		}
+	}
+
+	reductionPercent := 100.0
+	if totalInputWords > 0 {
+		reductionPercent = 100.0 - (float64(totalOutputWords)/float64(totalInputWords))*100.0
+	}
+
+	log.Printf("Processing completed in %v, received %d valid results out of %d chunks",
+		time.Since(startTime), validResults, len(chunks))
+	log.Printf("Total input: %d words, total output: %d words (%.1f%% reduction)",
+		totalInputWords, totalOutputWords, reductionPercent)
+
+	if mode == "transcript" && validResults > 0 {
+		log.Printf("Applying transcript formatting to %d chunks", validResults)
+		var validChunks []string
+		for _, r := range results {
+			if r != "" {
+				validChunks = append(validChunks, r)
+			}
+		}
+
+		combinedResult := transcript.CombineTranscriptChunks(validChunks)
+		return []string{combinedResult}
+	}
+
+	return results
+}
+
+func ProcessTranscript(ctx context.Context, text string, cfg *config.Config, ratio float64) string {
+	log.Printf("Processing transcript of %d words with ratio %.2f", len(strings.Fields(text)), ratio)
+
+	chunks, err := chunker.ChunkTextBySpace(text, cfg.ChunkSize, cfg.ChunkOverlap)
+	if err != nil {
+		log.Printf("Error chunking transcript text: %v", err)
+		return ""
+	}
+
+	log.Printf("Chunked transcript into %d parts", len(chunks))
+
+	results := ProcessChunks(ctx, chunks, cfg, ratio, "transcript")
+
+	if len(results) == 0 {
+		log.Printf("No results returned from transcript processing")
+		return ""
+	}
+
+	return results[0]
+}
+
+
+
+================================================
+File: .github/workflows/deploy.yml
+================================================
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push image
+        run: |
+          IMAGE_TAG="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          LATEST_TAG="ghcr.io/${{ github.repository }}:latest"
+
+          echo "Building image: ${IMAGE_TAG}"
+          podman build -t ${IMAGE_TAG} -t ${LATEST_TAG} .
+
+          echo "Pushing image: ${IMAGE_TAG}"
+          podman push ${IMAGE_TAG}
+
+          echo "Pushing image: ${LATEST_TAG}"
+          podman push ${LATEST_TAG}
+
+      - name: Setup SSH key
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${VM_SSH_KEY}" | tr -d '\r' > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null || (echo "Invalid private key format provided in VM_SSH_KEY secret" && exit 1)
+
+      - name: Deploy to VM
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          ENV_FILE_CONTENTS: ${{ secrets.ENV_FILE_CONTENTS }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          IMAGE_NAME: "ghcr.io/${{ github.repository }}:latest"
+          CONTAINER_NAME: "${{ github.event.repository.name }}_container"
+        run: |
+          echo "Connecting to ${VM_USER}@${VM_HOST}..."
+          ssh -i ~/.ssh/ec2_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} /bin/bash <<EOF
+            set -e
+
+            echo "--> Setting up environment on VM..."
+            CONFIG_DIR="\$HOME/.config/${CONTAINER_NAME}"
+            SYSTEMD_USER_DIR="\$HOME/.config/systemd/user"
+            ENV_FILE_PATH="\${CONFIG_DIR}/.env"
+
+            mkdir -p "\${CONFIG_DIR}"
+            mkdir -p "\${SYSTEMD_USER_DIR}"
+
+            echo "${ENV_FILE_CONTENTS}" > "\${ENV_FILE_PATH}"
+
+            echo "--> Verifying env file exists at: \${ENV_FILE_PATH}"
+            ls -l "\${ENV_FILE_PATH}"
+            echo "--- Env file contents: ---"
+            cat "\${ENV_FILE_PATH}" || echo "Warning: Could not cat env file (might be empty)"
+            echo "--------------------------"
+
+            echo "--> Extracting PORT from \${ENV_FILE_PATH}..."
+            VM_PORT=\$(grep '^PORT=' "\${ENV_FILE_PATH}" | cut -d '=' -f 2-)
+
+            if [ -z "\${VM_PORT}" ]; then
+              echo "ERROR: PORT variable not found or empty in \${ENV_FILE_PATH}"
+              echo "Ensure your ENV_FILE_CONTENTS secret contains a line like 'PORT=8080'"
+              exit 1
+            fi
+            echo "PORT extracted: \${VM_PORT}"
+
+            echo "--> Logging into GHCR on VM..."
+            echo "${GHCR_TOKEN}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            echo "--> Pulling latest image: ${IMAGE_NAME}"
+            podman pull ${IMAGE_NAME}
+
+            SERVICE_NAME="${CONTAINER_NAME}.service"
+            SYSTEMD_UNIT_PATH="\${SYSTEMD_USER_DIR}/\${SERVICE_NAME}"
+
+            echo "--> Stopping and removing existing container (if any)..."
+            if systemctl --user is-active --quiet "\${SERVICE_NAME}"; then
+              echo "Stopping running systemd service: \${SERVICE_NAME}"
+              systemctl --user stop "\${SERVICE_NAME}"
+            else
+              echo "Systemd service \${SERVICE_NAME} not active, attempting podman stop..."
+              podman stop ${CONTAINER_NAME} || true
+            fi
+
+            podman rm ${CONTAINER_NAME} || true
+
+            echo "--> Creating new container definition: ${CONTAINER_NAME}"
+            podman create \
+              -p "\${VM_PORT}:\${VM_PORT}" \
+              --env-file "\${ENV_FILE_PATH}" \
+              --name ${CONTAINER_NAME} \
+              ${IMAGE_NAME}
+
+            if [ \$? -ne 0 ]; then
+                echo "ERROR: Failed to create container ${CONTAINER_NAME}"
+                exit 1
+            fi
+
+            echo "--> Generating systemd unit file using redirection: \${SYSTEMD_UNIT_PATH}"
+            podman generate systemd --new --name ${CONTAINER_NAME} > "\${SYSTEMD_UNIT_PATH}"
+
+            if [ \$? -ne 0 ] || [ ! -f "\${SYSTEMD_UNIT_PATH}" ]; then
+                echo "ERROR: Failed to generate systemd unit file at \${SYSTEMD_UNIT_PATH} using redirection."
+                echo "Listing contents of \${SYSTEMD_USER_DIR}:"
+                ls -la "\${SYSTEMD_USER_DIR}" || echo "Could not list directory."
+                exit 1
+            fi
+            echo "Systemd unit file generated successfully."
+
+            echo "--> Reloading systemd user daemon..."
+            systemctl --user daemon-reload
+
+            echo "--> Enabling and starting systemd service: \${SERVICE_NAME}"
+            systemctl --user enable --now "\${SERVICE_NAME}"
+
+            echo "--> Checking service status:"
+            systemctl --user status "\${SERVICE_NAME}" --no-pager || echo "Warning: Service status check command failed, but deployment might still be okay."
+
+            echo "--> Cleaning up GHCR login token..."
+            podman logout ghcr.io || true
+
+            echo "--> Deployment successful!"
+          EOF
+
+          SSH_EXIT_CODE=$?
+          if [ ${SSH_EXIT_CODE} -ne 0 ]; then
+            echo "Deployment script failed on remote host with exit code ${SSH_EXIT_CODE}."
+            exit 1
+          fi
+
+
